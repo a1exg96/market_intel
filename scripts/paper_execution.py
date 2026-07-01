@@ -65,9 +65,12 @@ class PaperTradingConfig:
     live_trading: bool = False
     initial_balance: float = LAB_CONFIG.initial_balance
     risk_per_trade: float = LAB_CONFIG.risk_per_trade
+    leverage: float = 1.0
     horizon_minutes: int = 240
     take_profit_pct: float = 1.0
     stop_loss_pct: float = 0.7
+    liquidation_long_pct: float = 0.7
+    liquidation_short_pct: float = 0.7
     fee_pct: float = LAB_CONFIG.fee_pct
     slippage_pct: float = LAB_CONFIG.slippage_pct
     confidence_threshold: float = LAB_CONFIG.confidence_threshold
@@ -82,10 +85,78 @@ def load_paper_trading_config(path: Path | None = None) -> PaperTradingConfig:
             if not isinstance(loaded, dict):
                 raise RuntimeError(f"Invalid paper trading config: {config_path}")
             raw = loaded
-    config = PaperTradingConfig(**{k: v for k, v in raw.items() if k in PaperTradingConfig.__dataclass_fields__})
+    if "stake_pct" in raw and "risk_per_trade" not in raw:
+        raw["risk_per_trade"] = float(raw["stake_pct"]) / 100
+    fields = PaperTradingConfig.__dataclass_fields__
+    config = PaperTradingConfig(**{k: v for k, v in raw.items() if k in fields})
     if config.live_trading:
         raise RuntimeError("ERROR: live_trading=true is forbidden. Paper engine refuses to start.")
+    if config.leverage <= 0:
+        raise RuntimeError("ERROR: leverage must be positive.")
+    if not 0 < config.risk_per_trade <= 1:
+        raise RuntimeError("ERROR: risk_per_trade must be between 0 and 1.")
+    if config.liquidation_long_pct <= 0 or config.liquidation_short_pct <= 0:
+        raise RuntimeError("ERROR: liquidation percentages must be positive.")
     return config
+
+
+def paper_trading_settings(path: Path | None = None) -> dict[str, Any]:
+    config = load_paper_trading_config(path)
+    return {
+        "leverage": float(config.leverage),
+        "stake_pct": float(config.risk_per_trade * 100),
+        "liquidation_long_pct": float(config.liquidation_long_pct),
+        "liquidation_short_pct": float(config.liquidation_short_pct),
+        "take_profit_pct": float(config.take_profit_pct),
+        "horizon_minutes": int(config.horizon_minutes),
+        "confidence_threshold": float(config.confidence_threshold),
+    }
+
+
+def update_paper_trading_settings(values: dict[str, Any], path: Path | None = None) -> dict[str, Any]:
+    config_path = path or CONFIG_DIR / "paper_trading.yaml"
+    raw: dict[str, Any] = {}
+    if config_path.exists():
+        with config_path.open("r", encoding="utf-8") as handle:
+            loaded = yaml.safe_load(handle) or {}
+            if not isinstance(loaded, dict):
+                raise RuntimeError(f"Invalid paper trading config: {config_path}")
+            raw = loaded
+
+    def positive_float(key: str, minimum: float, maximum: float | None = None) -> float | None:
+        if key not in values:
+            return None
+        try:
+            value = float(values[key])
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{key} must be a number") from exc
+        if value < minimum or (maximum is not None and value > maximum):
+            limit = f" between {minimum} and {maximum}" if maximum is not None else f" at least {minimum}"
+            raise ValueError(f"{key} must be{limit}")
+        return value
+
+    leverage = positive_float("leverage", 0.1, 125)
+    if leverage is not None:
+        raw["leverage"] = leverage
+
+    stake_pct = positive_float("stake_pct", 0.01, 100)
+    if stake_pct is not None:
+        raw["risk_per_trade"] = stake_pct / 100
+
+    liquidation_long_pct = positive_float("liquidation_long_pct", 0.01, 100)
+    if liquidation_long_pct is not None:
+        raw["liquidation_long_pct"] = liquidation_long_pct
+
+    liquidation_short_pct = positive_float("liquidation_short_pct", 0.01, 100)
+    if liquidation_short_pct is not None:
+        raw["liquidation_short_pct"] = liquidation_short_pct
+
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = config_path.with_name(f".{config_path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        yaml.safe_dump(raw, handle, sort_keys=False)
+    tmp_path.replace(config_path)
+    return paper_trading_settings(config_path)
 
 
 def ensure_paper_files() -> None:
@@ -399,6 +470,20 @@ def _unrealized_return(side: str, entry_price: float, current_price: float) -> f
     return (current_price / entry_price) - 1
 
 
+def _leveraged_return(unrealized: float, config: PaperTradingConfig) -> float:
+    return unrealized * float(config.leverage)
+
+
+def _round_trip_cost(config: PaperTradingConfig) -> float:
+    return (float(config.fee_pct) * 2 + float(config.slippage_pct)) * float(config.leverage)
+
+
+def _liquidation_pct(side: str, config: PaperTradingConfig) -> float:
+    if side.upper() == "SHORT":
+        return float(config.liquidation_short_pct)
+    return float(config.liquidation_long_pct)
+
+
 def latest_local_prices() -> dict[str, float]:
     prices: dict[str, float] = {}
     for symbol in market_symbols():
@@ -451,10 +536,11 @@ def update_open_positions(
             entry_price = float(row["entry_price"])
             side = str(row["side"]).upper()
             unrealized = float(_unrealized_return(side, entry_price, current_price))
+            leveraged_unrealized = _leveraged_return(unrealized, config)
             position_size = float(row["position_size"])
             positions.at[idx, "current_price"] = current_price
-            positions.at[idx, "unrealized_pnl_usd"] = position_size * unrealized
-            positions.at[idx, "unrealized_pnl_pct"] = unrealized * 100
+            positions.at[idx, "unrealized_pnl_usd"] = position_size * leveraged_unrealized
+            positions.at[idx, "unrealized_pnl_pct"] = leveraged_unrealized * 100
 
             opened_at = pd.Timestamp(row["opened_at"]).to_pydatetime()
             if opened_at.tzinfo is None:
@@ -462,10 +548,10 @@ def update_open_positions(
             exit_reason = ""
             if current_price == entry_price:
                 exit_reason = ""
-            elif unrealized >= config.take_profit_pct / 100:
+            elif leveraged_unrealized >= config.take_profit_pct / 100:
                 exit_reason = "TAKE_PROFIT"
-            elif unrealized <= -(config.stop_loss_pct / 100):
-                exit_reason = "STOP_LOSS"
+            elif leveraged_unrealized <= -(_liquidation_pct(side, config) / 100):
+                exit_reason = "LIQUIDATION"
             elif now - opened_at >= timedelta(minutes=config.horizon_minutes):
                 exit_reason = "HORIZON"
             if not exit_reason:
@@ -475,7 +561,7 @@ def update_open_positions(
             if position_id in existing_trade_ids:
                 positions.at[idx, "status"] = "CLOSED"
                 continue
-            net_return = unrealized - config.fee_pct * 2 - config.slippage_pct
+            net_return = leveraged_unrealized - _round_trip_cost(config)
             pnl_usd = position_size * net_return
             balance += pnl_usd
             closed_rows.append(
@@ -503,6 +589,58 @@ def update_open_positions(
             _append_csv(TRADES_PATH, TRADE_COLUMNS, closed_rows)
         _write_active_positions(positions)
         return positions
+
+
+def close_position_manually(position_id: str, config: PaperTradingConfig | None = None) -> dict[str, Any]:
+    with _paper_state_lock():
+        ensure_paper_files()
+        config = config or load_paper_trading_config()
+        positions = read_active_positions()
+        if positions.empty:
+            raise KeyError(position_id)
+
+        matches = positions.index[
+            (positions["position_id"].astype(str) == str(position_id))
+            & (positions["status"].astype(str).str.upper() == "OPEN")
+        ].tolist()
+        if not matches:
+            raise KeyError(position_id)
+
+        idx = matches[0]
+        row = positions.loc[idx]
+        symbol = str(row["symbol"])
+        current_price = float(latest_local_prices().get(symbol, row["current_price"]))
+        entry_price = float(row["entry_price"])
+        side = str(row["side"]).upper()
+        position_size = float(row["position_size"])
+        leveraged_unrealized = _leveraged_return(_unrealized_return(side, entry_price, current_price), config)
+        net_return = leveraged_unrealized - _round_trip_cost(config)
+        pnl_usd = position_size * net_return
+        balance_after = _realized_balance(config) + pnl_usd
+        closed_at = datetime.now(timezone.utc).isoformat()
+        trade = {
+            "position_id": str(position_id),
+            "opened_at": row["opened_at"],
+            "closed_at": closed_at,
+            "symbol": symbol,
+            "side": side,
+            "entry_price": entry_price,
+            "exit_price": current_price,
+            "position_size": position_size,
+            "confidence": row["confidence"],
+            "pnl_usd": pnl_usd,
+            "pnl_pct": net_return * 100,
+            "balance_after": balance_after,
+            "reason": "MANUAL",
+            "model_version": row["model_version"],
+        }
+        positions.at[idx, "current_price"] = current_price
+        positions.at[idx, "unrealized_pnl_usd"] = position_size * leveraged_unrealized
+        positions.at[idx, "unrealized_pnl_pct"] = leveraged_unrealized * 100
+        positions.at[idx, "status"] = "CLOSED"
+        _append_csv(TRADES_PATH, TRADE_COLUMNS, [trade])
+        _write_active_positions(positions)
+        return trade
 
 
 def execute_latest_unaudited_signal() -> dict[str, Any] | None:
@@ -543,6 +681,7 @@ def stats_snapshot() -> dict[str, Any]:
         "profit_factor": profit_factor(trade_returns),
         "max_drawdown": max_drawdown(balances),
         "last_update": datetime.now(timezone.utc).isoformat(),
+        "settings": paper_trading_settings(),
     }
 
 

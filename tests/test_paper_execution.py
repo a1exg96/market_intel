@@ -335,6 +335,137 @@ class PaperExecutionTest(unittest.TestCase):
                     pe.latest_local_prices,
                 ) = original_paths
 
+    def test_settings_update_persists_leverage_stake_and_liquidation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "paper_trading.yaml"
+            config_path.write_text(
+                "live_trading: false\ninitial_balance: 1000.0\nrisk_per_trade: 0.01\n",
+                encoding="utf-8",
+            )
+
+            settings = pe.update_paper_trading_settings(
+                {
+                    "leverage": 7,
+                    "stake_pct": 2.5,
+                    "liquidation_long_pct": 3.1,
+                    "liquidation_short_pct": 4.2,
+                },
+                path=config_path,
+            )
+            config = pe.load_paper_trading_config(config_path)
+
+            self.assertEqual(settings["leverage"], 7.0)
+            self.assertEqual(settings["stake_pct"], 2.5)
+            self.assertEqual(config.risk_per_trade, 0.025)
+            self.assertEqual(config.liquidation_long_pct, 3.1)
+            self.assertEqual(config.liquidation_short_pct, 4.2)
+
+    def test_leverage_multiplies_unrealized_pnl_and_liquidation_closes_by_side(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reports = Path(tmp)
+            original_paths = (
+                pe.ACTIVE_POSITIONS_PATH,
+                pe.TRADES_PATH,
+                pe.AUDIT_PATH,
+                pe.SIGNALS_PATH,
+                pe.LOCK_PATH,
+                pe.latest_local_prices,
+            )
+            pe.ACTIVE_POSITIONS_PATH = reports / "active_positions.csv"
+            pe.TRADES_PATH = reports / "trades.csv"
+            pe.AUDIT_PATH = reports / "signal_execution_audit.csv"
+            pe.SIGNALS_PATH = reports / "forward_signals.csv"
+            pe.LOCK_PATH = reports / ".paper_execution.lock"
+            pe.latest_local_prices = lambda: {"BTCUSDT": 100.0}
+            try:
+                config = PaperTradingConfig(
+                    initial_balance=1000.0,
+                    risk_per_trade=0.10,
+                    leverage=5.0,
+                    confidence_threshold=0.60,
+                    take_profit_pct=50.0,
+                    liquidation_long_pct=4.0,
+                    liquidation_short_pct=4.0,
+                )
+                pe.open_position_from_signal(
+                    {
+                        "symbol": "BTCUSDT",
+                        "signal": "LONG",
+                        "confidence": 0.675,
+                        "price": 100,
+                        "decision": "EXECUTABLE",
+                    },
+                    config=config,
+                )
+
+                pe.update_open_positions(price_by_symbol={"BTCUSDT": 99.0}, config=config)
+                positions = pe.read_active_positions(open_only=False)
+                trades = pe.read_trades()
+
+                self.assertEqual(positions.loc[0, "status"], "CLOSED")
+                self.assertEqual(trades.loc[0, "reason"], "LIQUIDATION")
+                self.assertAlmostEqual(float(positions.loc[0, "unrealized_pnl_usd"]), -5.0, places=6)
+            finally:
+                (
+                    pe.ACTIVE_POSITIONS_PATH,
+                    pe.TRADES_PATH,
+                    pe.AUDIT_PATH,
+                    pe.SIGNALS_PATH,
+                    pe.LOCK_PATH,
+                    pe.latest_local_prices,
+                ) = original_paths
+
+    def test_manual_close_moves_open_position_to_trades(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reports = Path(tmp)
+            original_paths = (
+                pe.ACTIVE_POSITIONS_PATH,
+                pe.TRADES_PATH,
+                pe.AUDIT_PATH,
+                pe.SIGNALS_PATH,
+                pe.LOCK_PATH,
+                pe.latest_local_prices,
+            )
+            pe.ACTIVE_POSITIONS_PATH = reports / "active_positions.csv"
+            pe.TRADES_PATH = reports / "trades.csv"
+            pe.AUDIT_PATH = reports / "signal_execution_audit.csv"
+            pe.SIGNALS_PATH = reports / "forward_signals.csv"
+            pe.LOCK_PATH = reports / ".paper_execution.lock"
+            pe.latest_local_prices = lambda: {"BTCUSDT": 100.0}
+            try:
+                config = PaperTradingConfig(initial_balance=1000.0, risk_per_trade=0.10, confidence_threshold=0.60)
+                opened = pe.open_position_from_signal(
+                    {
+                        "symbol": "BTCUSDT",
+                        "signal": "SHORT",
+                        "confidence": 0.675,
+                        "price": 100,
+                        "decision": "EXECUTABLE",
+                    },
+                    config=config,
+                )
+                self.assertIsNotNone(opened)
+
+                pe.latest_local_prices = lambda: {"BTCUSDT": 98.0}
+                closed = pe.close_position_manually(opened["position_id"], config=config)
+                active = pe.read_active_positions(open_only=True)
+                trades = pe.read_trades()
+
+                self.assertEqual(len(active), 0)
+                self.assertEqual(len(trades), 1)
+                self.assertEqual(closed["reason"], "MANUAL")
+                self.assertEqual(trades.loc[0, "position_id"], opened["position_id"])
+                self.assertGreater(float(trades.loc[0, "pnl_usd"]), 0)
+            finally:
+                (
+                    pe.ACTIVE_POSITIONS_PATH,
+                    pe.TRADES_PATH,
+                    pe.AUDIT_PATH,
+                    pe.SIGNALS_PATH,
+                    pe.LOCK_PATH,
+                    pe.latest_local_prices,
+                ) = original_paths
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,8 @@ from scripts.cache import redis_status
 from scripts.common import RAW_DIR, LAB_CONFIG, read_parquet
 from scripts.db import init_db, latest_dashboard_snapshot
 from scripts.paper_execution import (
+    close_position_manually,
+    paper_trading_settings,
     read_active_positions,
     read_audit,
     read_signals,
@@ -24,6 +26,7 @@ from scripts.paper_execution import (
     records,
     stats_snapshot,
     update_open_positions,
+    update_paper_trading_settings,
 )
 
 STARTED_AT = time.time()
@@ -320,6 +323,30 @@ def api_market_prices() -> list[dict[str, Any]]:
     return _market_price_rows()
 
 
+@app.get("/api/settings")
+def api_settings() -> dict[str, Any]:
+    return paper_trading_settings()
+
+
+@app.post("/api/settings")
+async def api_update_settings(request: Request) -> dict[str, Any]:
+    try:
+        payload = await request.json()
+        if not isinstance(payload, dict):
+            raise ValueError("Settings payload must be an object.")
+        return update_paper_trading_settings(payload)
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
+
+
+@app.post("/api/positions/{position_id}/close")
+def api_close_position(position_id: str) -> dict[str, Any]:
+    try:
+        return _with_kyiv_times(close_position_manually(position_id))
+    except KeyError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Open position not found.") from exc
+
+
 @app.get("/api/summary")
 def summary() -> dict[str, Any]:
     signals = api_signals()
@@ -337,6 +364,7 @@ def summary() -> dict[str, Any]:
         "signals": signals,
         "signal_execution_audit": audit,
         "market_prices": api_market_prices(),
+        "settings": api_settings(),
         "logs": logs,
     }
 
@@ -379,6 +407,14 @@ def index() -> str:
     .priceSymbol { color:var(--muted); font-size:10px; }
     .priceValue { font-size:11px; text-align:right; font-weight:700; }
     .priceTime { grid-column:1 / -1; color:var(--muted); font-size:9px; display:flex; justify-content:space-between; gap:8px; }
+    .settingsGrid { display:grid; grid-template-columns:repeat(5, minmax(120px, 1fr)); gap:8px; align-items:end; }
+    .field { display:grid; gap:4px; }
+    .field label { color:var(--muted); font-size:10px; }
+    .field input { width:100%; border:1px solid var(--line); border-radius:6px; background:#11161c; color:var(--text); padding:7px 8px; font-size:12px; }
+    .actionBtn { border:0; border-radius:6px; background:var(--blue); color:#06111f; padding:8px 10px; font-weight:700; cursor:pointer; }
+    .closeBtn { width:24px; height:24px; border:1px solid #6d1d2a; border-radius:6px; background:#35131a; color:var(--red); font-weight:700; cursor:pointer; line-height:1; }
+    .closeBtn:disabled, .actionBtn:disabled { opacity:.55; cursor:wait; }
+    .settingsStatus { color:var(--muted); font-size:10px; min-height:13px; }
     .scroll { max-height:210px; overflow-y:auto; }
     .scrollSmall { max-height:92px; overflow-y:auto; }
     .profit { color:var(--green); }
@@ -394,8 +430,8 @@ def index() -> str:
     .badgeLong { background:#12351f; color:var(--green); }
     .badgeShort { background:#3d1420; color:var(--red); }
     .badgeFlat { background:#263241; color:#cbd5e1; }
-    @media (max-width:1200px) { .grid { grid-template-columns:repeat(3, minmax(0, 1fr)); } .twoCol { grid-template-columns:1fr; } }
-    @media (max-width:760px) { header { align-items:flex-start; flex-direction:column; } main { padding:8px; } .grid, .signalBox { grid-template-columns:repeat(2, minmax(0, 1fr)); } .value { font-size:11px; } }
+    @media (max-width:1200px) { .grid { grid-template-columns:repeat(3, minmax(0, 1fr)); } .twoCol { grid-template-columns:1fr; } .settingsGrid { grid-template-columns:repeat(2, minmax(0, 1fr)); } }
+    @media (max-width:760px) { header { align-items:flex-start; flex-direction:column; } main { padding:8px; } .grid, .signalBox, .settingsGrid { grid-template-columns:repeat(2, minmax(0, 1fr)); } .value { font-size:11px; } }
   </style>
 </head>
 <body>
@@ -415,6 +451,16 @@ def index() -> str:
       <div class="card"><div class="label">Profit Factor</div><div class="value" id="pf">-</div></div>
       <div class="card"><div class="label">Макс. просадка</div><div class="value" id="maxdd">-</div></div>
     </section>
+    <section class="panel compactPanel">
+      <h3>Налаштування ставки</h3>
+      <form id="settingsForm" class="settingsGrid">
+        <div class="field"><label for="leverageInput">Кредитне плече, x</label><input id="leverageInput" name="leverage" type="number" min="0.1" max="125" step="0.1" required /></div>
+        <div class="field"><label for="stakeInput">Ставка, % балансу</label><input id="stakeInput" name="stake_pct" type="number" min="0.01" max="100" step="0.01" required /></div>
+        <div class="field"><label for="liqLongInput">Ліквідація LONG, %</label><input id="liqLongInput" name="liquidation_long_pct" type="number" min="0.01" max="100" step="0.01" required /></div>
+        <div class="field"><label for="liqShortInput">Ліквідація SHORT, %</label><input id="liqShortInput" name="liquidation_short_pct" type="number" min="0.01" max="100" step="0.01" required /></div>
+        <div class="field"><button class="actionBtn" id="settingsSave" type="submit">Зберегти</button><div class="settingsStatus" id="settingsStatus"></div></div>
+      </form>
+    </section>
     <section class="twoCol">
       <div class="panel">
         <h3>Ринкові ціни</h3>
@@ -427,7 +473,7 @@ def index() -> str:
     </section>
     <section class="panel compactPanel">
       <h3>Активні позиції</h3>
-      <div class="tableWrap"><table class="compactTable"><thead><tr><th>ID</th><th>Відкрито</th><th>Пара</th><th>Сторона</th><th>Вхід</th><th>Поточна</th><th>Розмір</th><th>Поточна сума</th><th>Впевн.</th><th>PnL USD</th><th>PnL %</th><th>Статус</th></tr></thead><tbody id="positionRows"></tbody></table></div>
+      <div class="tableWrap"><table class="compactTable"><thead><tr><th></th><th>ID</th><th>Відкрито</th><th>Пара</th><th>Сторона</th><th>Вхід</th><th>Поточна</th><th>Розмір</th><th>Поточна сума</th><th>Впевн.</th><th>PnL USD</th><th>PnL %</th><th>Статус</th></tr></thead><tbody id="positionRows"></tbody></table></div>
     </section>
     <section class="panel shortPanel">
       <h3>Закриті угоди</h3>
@@ -440,13 +486,14 @@ def index() -> str:
   </main>
 <script>
 async function refresh() {
-  const [stats, positions, trades, signals, audit, prices] = await Promise.all([
+  const [stats, positions, trades, signals, audit, prices, settings] = await Promise.all([
     fetch('/api/stats').then(r => r.json()),
     fetch('/api/active-positions').then(r => r.json()),
     fetch('/api/trades').then(r => r.json()),
     fetch('/api/signals').then(r => r.json()),
     fetch('/api/signal-execution-audit').then(r => r.json()),
-    fetch('/api/market-prices').then(r => r.json())
+    fetch('/api/market-prices').then(r => r.json()),
+    fetch('/api/settings').then(r => r.json())
   ]);
   setText('balance', money(stats.balance));
   setText('equityValue', money(stats.equity));
@@ -458,6 +505,7 @@ async function refresh() {
   setText('pf', Number.isFinite(stats.profit_factor) ? fmt(stats.profit_factor, 2) : 'inf');
   setText('maxdd', pct(stats.max_drawdown));
   renderSignal(signals[0] || null, audit[0] || null);
+  renderSettings(settings || stats.settings || {});
   renderPositions(positions || []);
   renderPrices(prices || []);
   renderTrades(trades || []);
@@ -480,6 +528,17 @@ function signalBadge(signal) {
 }
 function sideClass(side) { return String(side).toUpperCase() === 'SHORT' ? 'sideShort' : 'sideLong'; }
 function pnlClass(v) { return Number(v || 0) >= 0 ? 'profit' : 'loss'; }
+function setInput(id, value, digits = 2) {
+  const input = document.getElementById(id);
+  if (document.activeElement === input) return;
+  input.value = Number(value || 0).toFixed(digits).replace(/\.?0+$/, '');
+}
+function renderSettings(settings) {
+  setInput('leverageInput', settings.leverage, 2);
+  setInput('stakeInput', settings.stake_pct, 2);
+  setInput('liqLongInput', settings.liquidation_long_pct, 2);
+  setInput('liqShortInput', settings.liquidation_short_pct, 2);
+}
 function renderSignal(signal, audit) {
   const root = document.getElementById('signal');
   if (!signal) {
@@ -510,7 +569,7 @@ function renderPrices(rows) {
 }
 function renderPositions(rows) {
   document.getElementById('positionRows').innerHTML = rows.map(p => `
-    <tr><td>${esc(p.position_id)}</td><td>${esc(displayTime(p.opened_at))}</td><td>${esc(p.symbol)}</td><td class="${sideClass(p.side)}">${esc(p.side)}</td><td>${fmt(p.entry_price)}</td><td>${fmt(p.current_price)}</td><td>${fmt(p.position_size, 2)}</td><td>${fmt(Number(p.position_size || 0) + Number(p.unrealized_pnl_usd || 0), 2)}</td><td>${pct(p.confidence)}</td><td class="${pnlClass(p.unrealized_pnl_usd)}">${fmt(p.unrealized_pnl_usd, 2)}</td><td class="${pnlClass(p.unrealized_pnl_pct)}">${pctRaw(p.unrealized_pnl_pct)}</td><td>${esc(p.status)}</td></tr>
+    <tr><td><button class="closeBtn" type="button" data-position-id="${esc(p.position_id)}" title="Закрити вручну">x</button></td><td>${esc(p.position_id)}</td><td>${esc(displayTime(p.opened_at))}</td><td>${esc(p.symbol)}</td><td class="${sideClass(p.side)}">${esc(p.side)}</td><td>${fmt(p.entry_price)}</td><td>${fmt(p.current_price)}</td><td>${fmt(p.position_size, 2)}</td><td>${fmt(Number(p.position_size || 0) + Number(p.unrealized_pnl_usd || 0), 2)}</td><td>${pct(p.confidence)}</td><td class="${pnlClass(p.unrealized_pnl_usd)}">${fmt(p.unrealized_pnl_usd, 2)}</td><td class="${pnlClass(p.unrealized_pnl_pct)}">${pctRaw(p.unrealized_pnl_pct)}</td><td>${esc(p.status)}</td></tr>
   `).join('');
 }
 function renderTrades(rows) {
@@ -525,6 +584,41 @@ function renderSignals(rows) {
 }
 refresh();
 setInterval(refresh, 5000);
+document.getElementById('settingsForm').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const button = document.getElementById('settingsSave');
+  const status = document.getElementById('settingsStatus');
+  button.disabled = true;
+  status.textContent = 'Збереження...';
+  const payload = Object.fromEntries(new FormData(event.currentTarget).entries());
+  const response = await fetch('/api/settings', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(payload)
+  });
+  button.disabled = false;
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    status.textContent = error.detail || 'Помилка';
+    return;
+  }
+  renderSettings(await response.json());
+  status.textContent = 'Збережено';
+  refresh();
+});
+document.getElementById('positionRows').addEventListener('click', async (event) => {
+  const button = event.target.closest('.closeBtn');
+  if (!button) return;
+  button.disabled = true;
+  const positionId = button.dataset.positionId;
+  const response = await fetch(`/api/positions/${encodeURIComponent(positionId)}/close`, {method: 'POST'});
+  if (!response.ok) {
+    button.disabled = false;
+    alert('Не вдалося закрити позицію');
+    return;
+  }
+  refresh();
+});
 </script>
 </body>
 </html>

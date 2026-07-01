@@ -1,9 +1,12 @@
 live_trading: false
 initial_balance: 1000.0
 risk_per_trade: 0.01
+leverage: 1.0
 horizon_minutes: 240
 take_profit_pct: 1.0
 stop_loss_pct: 0.7
+liquidation_long_pct: 0.7
+liquidation_short_pct: 0.7
 fee_pct: 0.0004
 slippage_pct: 0.0003
 confidence_threshold: 0.60
