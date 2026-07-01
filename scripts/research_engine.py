@@ -104,6 +104,11 @@ def _apply_confidence_threshold(predictions: pd.DataFrame, threshold: float) -> 
     classes: list[str] = []
     confidences: list[float] = []
     for _, row in out.iterrows():
+        if str(row.get("side", "")).upper() == "NO_TRADE" and "INSUFFICIENT_EMPIRICAL_EDGE" in str(row.get("reason", "")):
+            directions.append("flat")
+            classes.append("NO_TRADE")
+            confidences.append(float(max(row.get("long_probability", 0.0), row.get("short_probability", 0.0))))
+            continue
         long_prob = float(row.get("long_probability", 0.0))
         short_prob = float(row.get("short_probability", 0.0))
         if long_prob >= threshold and long_prob >= short_prob:

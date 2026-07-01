@@ -13,6 +13,24 @@ from scripts.paper_execution import PaperTradingConfig
 
 
 class PaperExecutionTest(unittest.TestCase):
+    def _edge_signal(self, side: str, price: float, confidence: float = 0.675) -> dict[str, object]:
+        if side.upper() == "SHORT":
+            stop_loss = price * 1.01
+            take_profit = price * 0.98
+        else:
+            stop_loss = price * 0.99
+            take_profit = price * 1.02
+        return {
+            "confidence": confidence,
+            "expected_return": 0.004,
+            "expected_risk": 0.011,
+            "risk_reward": 2.0,
+            "position_size": 1000.0,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+            "reason": "positive_expectancy_risk_managed_setup",
+        }
+
     def test_dashboard_time_fields_are_returned_in_kyiv_time(self) -> None:
         from scripts.dashboard_app import _with_kyiv_times
 
@@ -139,6 +157,7 @@ class PaperExecutionTest(unittest.TestCase):
                         "regime": "RANGE",
                         "model_version": "test_v1",
                         "decision": "EXECUTABLE",
+                        **self._edge_signal("SHORT", 60000.0, confidence=0.647),
                     },
                     config=config,
                 )
@@ -194,6 +213,7 @@ class PaperExecutionTest(unittest.TestCase):
                     "regime": "UNKNOWN",
                     "model_version": "dual_setup_v0.2",
                     "decision": "Executable paper signal",
+                    **self._edge_signal("SHORT", 60000.0),
                 }
 
                 opened = pe.open_position_from_signal(signal, config=config)
@@ -258,6 +278,7 @@ class PaperExecutionTest(unittest.TestCase):
                         "regime": "UNKNOWN",
                         "model_version": "dual_setup_v0.2",
                         "decision": "Executable paper signal",
+                        **self._edge_signal("LONG", 60360.0),
                     },
                     config=config,
                 )
@@ -314,6 +335,7 @@ class PaperExecutionTest(unittest.TestCase):
                         "regime": "UNKNOWN",
                         "model_version": "dual_setup_v0.2",
                         "decision": "Executable paper signal",
+                        **self._edge_signal("LONG", 58704.0),
                     },
                     config=config,
                 )
@@ -346,7 +368,7 @@ class PaperExecutionTest(unittest.TestCase):
             settings = pe.update_paper_trading_settings(
                 {
                     "leverage": 7,
-                    "stake_pct": 2.5,
+                    "stake_pct": 0.5,
                     "liquidation_long_pct": 3.1,
                     "liquidation_short_pct": 4.2,
                 },
@@ -355,12 +377,12 @@ class PaperExecutionTest(unittest.TestCase):
             config = pe.load_paper_trading_config(config_path)
 
             self.assertEqual(settings["leverage"], 7.0)
-            self.assertEqual(settings["stake_pct"], 2.5)
-            self.assertEqual(config.risk_per_trade, 0.025)
+            self.assertEqual(settings["stake_pct"], 0.5)
+            self.assertEqual(config.risk_per_trade, 0.005)
             self.assertEqual(config.liquidation_long_pct, 3.1)
             self.assertEqual(config.liquidation_short_pct, 4.2)
 
-    def test_leverage_multiplies_unrealized_pnl_and_liquidation_closes_by_side(self) -> None:
+    def test_leverage_multiplies_unrealized_pnl_and_stop_loss_prevents_liquidation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp)
             original_paths = (
@@ -380,7 +402,7 @@ class PaperExecutionTest(unittest.TestCase):
             try:
                 config = PaperTradingConfig(
                     initial_balance=1000.0,
-                    risk_per_trade=0.10,
+                    risk_per_trade=0.01,
                     leverage=5.0,
                     confidence_threshold=0.60,
                     take_profit_pct=50.0,
@@ -394,6 +416,7 @@ class PaperExecutionTest(unittest.TestCase):
                         "confidence": 0.675,
                         "price": 100,
                         "decision": "EXECUTABLE",
+                        **self._edge_signal("LONG", 100.0),
                     },
                     config=config,
                 )
@@ -403,8 +426,51 @@ class PaperExecutionTest(unittest.TestCase):
                 trades = pe.read_trades()
 
                 self.assertEqual(positions.loc[0, "status"], "CLOSED")
-                self.assertEqual(trades.loc[0, "reason"], "LIQUIDATION")
-                self.assertAlmostEqual(float(positions.loc[0, "unrealized_pnl_usd"]), -5.0, places=6)
+                self.assertEqual(trades.loc[0, "reason"], "STOP_LOSS")
+                self.assertAlmostEqual(float(positions.loc[0, "unrealized_pnl_usd"]), -10.0, places=6)
+            finally:
+                (
+                    pe.ACTIVE_POSITIONS_PATH,
+                    pe.TRADES_PATH,
+                    pe.AUDIT_PATH,
+                    pe.SIGNALS_PATH,
+                    pe.LOCK_PATH,
+                    pe.latest_local_prices,
+                ) = original_paths
+
+    def test_high_confidence_without_positive_expectancy_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reports = Path(tmp)
+            original_paths = (
+                pe.ACTIVE_POSITIONS_PATH,
+                pe.TRADES_PATH,
+                pe.AUDIT_PATH,
+                pe.SIGNALS_PATH,
+                pe.LOCK_PATH,
+                pe.latest_local_prices,
+            )
+            pe.ACTIVE_POSITIONS_PATH = reports / "active_positions.csv"
+            pe.TRADES_PATH = reports / "trades.csv"
+            pe.AUDIT_PATH = reports / "signal_execution_audit.csv"
+            pe.SIGNALS_PATH = reports / "forward_signals.csv"
+            pe.LOCK_PATH = reports / ".paper_execution.lock"
+            pe.latest_local_prices = lambda: {"BTCUSDT": 100.0}
+            try:
+                config = PaperTradingConfig(initial_balance=1000.0, risk_per_trade=0.01, confidence_threshold=0.60)
+                opened = pe.open_position_from_signal(
+                    {
+                        "symbol": "BTCUSDT",
+                        "signal": "LONG",
+                        "confidence": 0.95,
+                        "price": 100,
+                        "decision": "EXECUTABLE",
+                    },
+                    config=config,
+                )
+                audit = pe.read_audit()
+
+                self.assertIsNone(opened)
+                self.assertEqual(audit.loc[0, "reason"], "NON_POSITIVE_EXPECTANCY")
             finally:
                 (
                     pe.ACTIVE_POSITIONS_PATH,
@@ -433,7 +499,7 @@ class PaperExecutionTest(unittest.TestCase):
             pe.LOCK_PATH = reports / ".paper_execution.lock"
             pe.latest_local_prices = lambda: {"BTCUSDT": 100.0}
             try:
-                config = PaperTradingConfig(initial_balance=1000.0, risk_per_trade=0.10, confidence_threshold=0.60)
+                config = PaperTradingConfig(initial_balance=1000.0, risk_per_trade=0.01, confidence_threshold=0.60)
                 opened = pe.open_position_from_signal(
                     {
                         "symbol": "BTCUSDT",
@@ -441,6 +507,7 @@ class PaperExecutionTest(unittest.TestCase):
                         "confidence": 0.675,
                         "price": 100,
                         "decision": "EXECUTABLE",
+                        **self._edge_signal("SHORT", 100.0),
                     },
                     config=config,
                 )

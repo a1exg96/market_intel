@@ -4,6 +4,14 @@ Local research/demo system for crypto market intelligence on top of Freqtrade co
 
 This is not financial advice and does not execute real orders.
 
+## Model Plugin Contract
+
+The service owns data collection, risk management, paper/live policy, execution, and audit logs. Models are replaceable plugins: each model receives the same standard input payload and returns the same standard decision payload. New model integration rules are documented in:
+
+```text
+docs/model_plugin_contract.md
+```
+
 ## Install
 
 ```bash

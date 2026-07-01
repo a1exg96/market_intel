@@ -25,6 +25,11 @@ ACTIVE_POSITION_COLUMNS = [
     "current_price",
     "position_size",
     "confidence",
+    "expected_return",
+    "expected_risk",
+    "risk_reward",
+    "stop_loss",
+    "take_profit",
     "regime",
     "model_version",
     "reason",
@@ -42,6 +47,11 @@ TRADE_COLUMNS = [
     "exit_price",
     "position_size",
     "confidence",
+    "expected_return",
+    "expected_risk",
+    "risk_reward",
+    "stop_loss",
+    "take_profit",
     "pnl_usd",
     "pnl_pct",
     "balance_after",
@@ -74,6 +84,11 @@ class PaperTradingConfig:
     fee_pct: float = LAB_CONFIG.fee_pct
     slippage_pct: float = LAB_CONFIG.slippage_pct
     confidence_threshold: float = LAB_CONFIG.confidence_threshold
+    min_expected_return: float = 0.0005
+    min_risk_reward: float = 1.5
+    cooldown_minutes: int = 60
+    loss_streak_reduce_after: int = 2
+    max_drawdown_live_block: float = 0.10
 
 
 def load_paper_trading_config(path: Path | None = None) -> PaperTradingConfig:
@@ -93,8 +108,8 @@ def load_paper_trading_config(path: Path | None = None) -> PaperTradingConfig:
         raise RuntimeError("ERROR: live_trading=true is forbidden. Paper engine refuses to start.")
     if config.leverage <= 0:
         raise RuntimeError("ERROR: leverage must be positive.")
-    if not 0 < config.risk_per_trade <= 1:
-        raise RuntimeError("ERROR: risk_per_trade must be between 0 and 1.")
+    if not 0 < config.risk_per_trade <= 0.01:
+        raise RuntimeError("ERROR: risk_per_trade must be between 0 and 0.01.")
     if config.liquidation_long_pct <= 0 or config.liquidation_short_pct <= 0:
         raise RuntimeError("ERROR: liquidation percentages must be positive.")
     return config
@@ -139,7 +154,7 @@ def update_paper_trading_settings(values: dict[str, Any], path: Path | None = No
     if leverage is not None:
         raw["leverage"] = leverage
 
-    stake_pct = positive_float("stake_pct", 0.01, 100)
+    stake_pct = positive_float("stake_pct", 0.01, 1)
     if stake_pct is not None:
         raw["risk_per_trade"] = stake_pct / 100
 
@@ -326,6 +341,17 @@ def _signal_price(signal: dict[str, Any]) -> float | None:
     return None
 
 
+def _signal_float(signal: dict[str, Any], key: str, default: float | None = None) -> float | None:
+    value = signal.get(key)
+    if value is None or value == "":
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
 def _execution_price(symbol: str, signal: dict[str, Any]) -> float | None:
     market_price = latest_local_prices().get(symbol)
     if market_price is not None:
@@ -384,6 +410,72 @@ def _realized_balance(config: PaperTradingConfig) -> float:
     return float(balances.iloc[-1]) if not balances.empty else float(config.initial_balance)
 
 
+def _risk_multiplier_from_history(trades: pd.DataFrame, config: PaperTradingConfig) -> float:
+    if trades.empty:
+        return 1.0
+    pnl = pd.to_numeric(trades["pnl_usd"], errors="coerce").fillna(0.0)
+    streak = 0
+    for value in reversed(pnl.tolist()):
+        if value < 0:
+            streak += 1
+        else:
+            break
+    if streak >= config.loss_streak_reduce_after + 2:
+        return 0.25
+    if streak >= config.loss_streak_reduce_after:
+        return 0.5
+    return 1.0
+
+
+def _historical_drawdown(trades: pd.DataFrame, config: PaperTradingConfig) -> float:
+    balances = [config.initial_balance]
+    if not trades.empty:
+        balances.extend(pd.to_numeric(trades["balance_after"], errors="coerce").dropna().astype(float).tolist())
+    return max_drawdown(balances)
+
+
+def _cooldown_active(symbol: str, trades: pd.DataFrame, config: PaperTradingConfig) -> bool:
+    if trades.empty or config.cooldown_minutes <= 0:
+        return False
+    if not {"symbol", "closed_at", "reason"}.issubset(trades.columns):
+        return False
+    closed_at = pd.to_datetime(trades["closed_at"], utc=True, errors="coerce", format="mixed")
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=config.cooldown_minutes)
+    reasons = trades["reason"].astype(str).str.upper()
+    matches = (
+        (trades["symbol"].astype(str) == symbol)
+        & closed_at.ge(recent_cutoff)
+        & reasons.isin(["STOP_LOSS", "LIQUIDATION", "MANUAL"])
+    )
+    return bool(matches.any())
+
+
+def _stop_distance(side: str, entry_price: float, stop_loss: float) -> float:
+    if entry_price <= 0 or stop_loss <= 0:
+        return 0.0
+    if side == "SHORT":
+        return (stop_loss / entry_price) - 1
+    return 1 - (stop_loss / entry_price)
+
+
+def _take_profit_distance(side: str, entry_price: float, take_profit: float) -> float:
+    if entry_price <= 0 or take_profit <= 0:
+        return 0.0
+    if side == "SHORT":
+        return 1 - (take_profit / entry_price)
+    return (take_profit / entry_price) - 1
+
+
+def _liquidation_buffer_is_safe(side: str, entry_price: float, stop_loss: float, config: PaperTradingConfig) -> bool:
+    leverage = max(float(config.leverage), 1.0)
+    liquidation_distance = min(0.95 / leverage, 0.95)
+    if side == "SHORT":
+        liquidation_price = entry_price * (1 + liquidation_distance)
+        return liquidation_price > stop_loss and (liquidation_price - stop_loss) / entry_price >= 0.005
+    liquidation_price = entry_price * (1 - liquidation_distance)
+    return liquidation_price < stop_loss and (stop_loss - liquidation_price) / entry_price >= 0.005
+
+
 def _audit(signal: dict[str, Any], action: str, executed: bool, reason: str, position_id: str = "") -> None:
     timestamp = datetime.now(timezone.utc).isoformat()
     price = _signal_price(signal)
@@ -428,6 +520,32 @@ def open_position_from_signal(signal: dict[str, Any], config: PaperTradingConfig
             _audit(signal, action, False, "MISSING_PRICE")
             return None
 
+        expected_return = _signal_float(signal, "expected_return")
+        expected_risk = _signal_float(signal, "expected_risk")
+        risk_reward = _signal_float(signal, "risk_reward")
+        stop_loss = _signal_float(signal, "stop_loss")
+        take_profit = _signal_float(signal, "take_profit")
+        if expected_return is None or expected_return < config.min_expected_return:
+            _audit(signal, action, False, "NON_POSITIVE_EXPECTANCY")
+            return None
+        if risk_reward is None or risk_reward < config.min_risk_reward:
+            _audit(signal, action, False, "LOW_RISK_REWARD")
+            return None
+        if stop_loss is None or take_profit is None:
+            _audit(signal, action, False, "MISSING_RISK_PLAN")
+            return None
+        stop_distance = _stop_distance(action, price, stop_loss)
+        take_profit_distance = _take_profit_distance(action, price, take_profit)
+        if stop_distance <= 0 or take_profit_distance <= 0:
+            _audit(signal, action, False, "INVALID_TP_SL")
+            return None
+        if take_profit_distance / max(stop_distance, 1e-9) < config.min_risk_reward:
+            _audit(signal, action, False, "LOW_TP_SL_RISK_REWARD")
+            return None
+        if not _liquidation_buffer_is_safe(action, price, stop_loss, config):
+            _audit(signal, action, False, "STOP_TOO_CLOSE_TO_LIQUIDATION")
+            return None
+
         active = read_active_positions(open_only=True)
         if not active.empty and symbol in set(active["symbol"].astype(str)):
             _audit(signal, action, False, "ALREADY_OPEN_POSITION")
@@ -438,7 +556,18 @@ def open_position_from_signal(signal: dict[str, Any], config: PaperTradingConfig
 
         opened_at = datetime.now(timezone.utc).isoformat()
         balance = _realized_balance(config)
-        position_size = min(balance, balance * config.risk_per_trade)
+        trades = read_trades()
+        if _cooldown_active(symbol, trades, config):
+            _audit(signal, action, False, "COOLDOWN_ACTIVE")
+            return None
+        if abs(_historical_drawdown(trades, config)) >= config.max_drawdown_live_block:
+            _audit(signal, action, False, "DRAWDOWN_LIVE_BLOCK")
+            return None
+        risk_fraction = min(float(config.risk_per_trade), 0.01) * _risk_multiplier_from_history(trades, config)
+        risk_budget = balance * risk_fraction
+        suggested_size = _signal_float(signal, "position_size", 0.0) or 0.0
+        risk_sized_position = risk_budget / max(stop_distance * float(config.leverage), 1e-9)
+        position_size = min(balance, risk_sized_position, suggested_size if suggested_size > 0 else balance)
         row = {
             "position_id": _position_id(symbol, action, opened_at, price),
             "opened_at": opened_at,
@@ -448,8 +577,13 @@ def open_position_from_signal(signal: dict[str, Any], config: PaperTradingConfig
             "current_price": price,
             "position_size": position_size,
             "confidence": confidence,
+            "expected_return": expected_return,
+            "expected_risk": expected_risk,
+            "risk_reward": risk_reward,
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
             "regime": signal.get("regime", "UNKNOWN"),
-            "model_version": signal.get("model_version", "baseline_v0.1"),
+            "model_version": signal.get("model_version", "dual_setup_v0.3_edge_score"),
             "reason": signal.get("reason", f"paper_{action.lower()}_confidence_{confidence:.3f}"),
             "unrealized_pnl_usd": 0.0,
             "unrealized_pnl_pct": 0.0,
@@ -546,12 +680,22 @@ def update_open_positions(
             if opened_at.tzinfo is None:
                 opened_at = opened_at.replace(tzinfo=timezone.utc)
             exit_reason = ""
-            if current_price == entry_price:
+            stop_loss = _signal_float(row.to_dict(), "stop_loss", 0.0) or 0.0
+            take_profit = _signal_float(row.to_dict(), "take_profit", 0.0) or 0.0
+            if side == "SHORT" and take_profit > 0 and current_price <= take_profit:
+                exit_reason = "TAKE_PROFIT"
+            elif side == "SHORT" and stop_loss > 0 and current_price >= stop_loss:
+                exit_reason = "STOP_LOSS"
+            elif side != "SHORT" and take_profit > 0 and current_price >= take_profit:
+                exit_reason = "TAKE_PROFIT"
+            elif side != "SHORT" and stop_loss > 0 and current_price <= stop_loss:
+                exit_reason = "STOP_LOSS"
+            elif current_price == entry_price:
                 exit_reason = ""
             elif leveraged_unrealized >= config.take_profit_pct / 100:
                 exit_reason = "TAKE_PROFIT"
-            elif leveraged_unrealized <= -(_liquidation_pct(side, config) / 100):
-                exit_reason = "LIQUIDATION"
+            elif leveraged_unrealized <= -(config.stop_loss_pct / 100):
+                exit_reason = "STOP_LOSS"
             elif now - opened_at >= timedelta(minutes=config.horizon_minutes):
                 exit_reason = "HORIZON"
             if not exit_reason:
@@ -575,6 +719,11 @@ def update_open_positions(
                     "exit_price": current_price,
                     "position_size": position_size,
                     "confidence": row["confidence"],
+                    "expected_return": row.get("expected_return", 0.0),
+                    "expected_risk": row.get("expected_risk", 0.0),
+                    "risk_reward": row.get("risk_reward", 0.0),
+                    "stop_loss": row.get("stop_loss", 0.0),
+                    "take_profit": row.get("take_profit", 0.0),
                     "pnl_usd": pnl_usd,
                     "pnl_pct": net_return * 100,
                     "balance_after": balance,
@@ -628,6 +777,11 @@ def close_position_manually(position_id: str, config: PaperTradingConfig | None 
             "exit_price": current_price,
             "position_size": position_size,
             "confidence": row["confidence"],
+            "expected_return": row.get("expected_return", 0.0),
+            "expected_risk": row.get("expected_risk", 0.0),
+            "risk_reward": row.get("risk_reward", 0.0),
+            "stop_loss": row.get("stop_loss", 0.0),
+            "take_profit": row.get("take_profit", 0.0),
             "pnl_usd": pnl_usd,
             "pnl_pct": net_return * 100,
             "balance_after": balance_after,

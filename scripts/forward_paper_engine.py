@@ -12,7 +12,26 @@ from scripts.execution_engine import HORIZON_ROWS
 from scripts.paper_execution import execute_latest_unaudited_signal, latest_local_prices, open_position_from_signal, update_open_positions
 
 LOGGER = logging.getLogger(__name__)
-SIGNAL_COLUMNS = ["timestamp", "generated_at", "symbol", "regime", "signal", "confidence", "entry_price", "horizon", "status"]
+SIGNAL_COLUMNS = [
+    "timestamp",
+    "generated_at",
+    "symbol",
+    "regime",
+    "signal",
+    "confidence",
+    "expected_return",
+    "expected_risk",
+    "risk_reward",
+    "volatility_state",
+    "entry_quality",
+    "position_size",
+    "stop_loss",
+    "take_profit",
+    "reason",
+    "entry_price",
+    "horizon",
+    "status",
+]
 RESULT_COLUMNS = ["timestamp", "symbol", "regime", "signal", "confidence", "entry_price", "exit_price", "future_return", "trade_return", "pnl", "balance"]
 
 
@@ -96,7 +115,12 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
     result_path = REPORTS_DIR / "forward_results.csv"
     existing_signals = _dedupe_by_symbol_time(_read_csv(signal_path, SIGNAL_COLUMNS), SIGNAL_COLUMNS)
     existing_results = _dedupe_by_symbol_time(_read_csv(result_path, RESULT_COLUMNS), RESULT_COLUMNS)
-    seen = {_row_key(row) for _, row in existing_signals.iterrows()} if not existing_signals.empty else set()
+    seen = set()
+    if not existing_signals.empty:
+        for _, existing in existing_signals.iterrows():
+            has_score_payload = "reason" in existing and pd.notna(existing.get("reason")) and str(existing.get("reason", "")).strip() != ""
+            if has_score_payload:
+                seen.add(_row_key(existing))
 
     feature_index = {(str(row["symbol"]), row["timestamp"]): i for i, row in features.iterrows()}
     new_signals: list[dict] = []
@@ -108,8 +132,9 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
         idx = feature_index.get((symbol, ts))
         if idx is None:
             continue
+        side = str(row.get("side", "") or "").upper()
         direction = str(row["predicted_direction"])
-        signal_name = "LONG" if direction == "up" else ("SHORT" if direction == "down" else "NO_TRADE")
+        signal_name = side if side in {"LONG", "SHORT", "NO_TRADE"} else ("LONG" if direction == "up" else ("SHORT" if direction == "down" else "NO_TRADE"))
         market_price = latest_local_prices().get(str(row["symbol"]))
         if signal_name == "NO_TRADE":
             entry_price = float(features.loc[idx, "close"])
@@ -133,9 +158,18 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
                 "regime": regime,
                 "signal": signal_name,
                 "confidence": float(row["confidence"]),
+                "expected_return": float(row.get("expected_return", 0.0) or 0.0),
+                "expected_risk": float(row.get("expected_risk", 0.0) or 0.0),
+                "risk_reward": float(row.get("risk_reward", 0.0) or 0.0),
+                "volatility_state": row.get("volatility_state", "UNKNOWN"),
+                "entry_quality": float(row.get("entry_quality", 0.0) or 0.0),
+                "position_size": float(row.get("position_size", 0.0) or 0.0),
+                "stop_loss": float(row.get("stop_loss", 0.0) or 0.0),
+                "take_profit": float(row.get("take_profit", 0.0) or 0.0),
+                "reason": row.get("reason", ""),
                 "entry_price": entry_price,
                 "horizon": row.get("horizon", "4h"),
-                "status": "PENDING",
+                "status": "EXECUTABLE" if signal_name in {"LONG", "SHORT"} else "NO_TRADE",
             }
         )
 
@@ -145,6 +179,10 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
         _dedupe_by_symbol_time(pd.concat([existing_signals, pd.DataFrame(new_signals)], ignore_index=True), SIGNAL_COLUMNS),
         max_signal_rows,
     )
+    if not signals.empty and "reason" in signals:
+        missing_reason = signals["reason"].isna() | (signals["reason"].astype(str).str.strip() == "")
+        signals.loc[missing_reason, "reason"] = "LEGACY_SIGNAL_NO_SCORING_PAYLOAD"
+        signals.loc[missing_reason & (signals["signal"].astype(str).str.upper() == "NO_TRADE"), "status"] = "NO_TRADE"
     result_seen = {_row_key(row) for _, row in existing_results.iterrows()} if not existing_results.empty else set()
     balance = LAB_CONFIG.initial_balance if existing_results.empty else float(existing_results["balance"].iloc[-1])
     new_results: list[dict] = []

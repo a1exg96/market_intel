@@ -63,6 +63,7 @@ def run_full() -> None:
     from scripts.signal_diagnostics import run_signal_diagnostics
     from scripts.stats_report import generate_report
     from scripts.target_audit import run_target_audit
+    from scripts.trading_audit_report import build_trading_audit_report
     from scripts.trade_rejection_report import build_trade_rejection_report
 
     privacy_check()
@@ -82,6 +83,7 @@ def run_full() -> None:
     run_research()
     adapt()
     generate_report()
+    build_trading_audit_report()
     init_knowledge_base()
 
 
@@ -121,6 +123,7 @@ def main(argv: list[str] | None = None) -> int:
             "dashboard",
             "adapt",
             "report",
+            "trading-audit",
             "full",
         ],
     )
@@ -260,6 +263,10 @@ def main(argv: list[str] | None = None) -> int:
         from scripts.stats_report import generate_report
 
         print(generate_report())
+    elif args.command == "trading-audit":
+        from scripts.trading_audit_report import build_trading_audit_report
+
+        print(build_trading_audit_report())
     elif args.command == "full":
         run_full()
     else:

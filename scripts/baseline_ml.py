@@ -14,12 +14,15 @@ from sklearn.utils.class_weight import compute_sample_weight
 
 from scripts.common import LAB_CONFIG, MODELS_DIR, PROCESSED_DIR, REPORTS_DIR, ensure_dirs, market_symbols, read_parquet
 from scripts.feature_engineering import feature_columns
+from scripts.scoring_engine import score_to_dict, build_trade_score
 
 LOGGER = logging.getLogger(__name__)
 TARGET_THRESHOLDS = [0.005, 0.010, 0.015, 0.020]
 CONFIDENCE_THRESHOLDS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
 BALANCE_METHODS = ["none", "class_weight", "undersample", "oversample", "balanced_sample_weight"]
 CALIBRATION_METHODS = ["none", "sigmoid", "isotonic"]
+MIN_EDGE_SAMPLES = 30
+MIN_EDGE_PRECISION = 0.52
 
 
 def threshold_suffix(threshold: float) -> str:
@@ -145,6 +148,67 @@ def _decision(
     return "NO_TRADE", "flat", best_prob, signal_score, regime_score, feature_stability_score
 
 
+def _prediction_row(
+    source: pd.Series,
+    long_prob: float,
+    short_prob: float,
+    predicted_class: str,
+    direction: str,
+    confidence: float,
+    signal_score: float,
+    regime_score: float,
+    feature_stability_score: float,
+    horizon: str,
+    target_threshold: float,
+    confidence_threshold: float,
+    feature_set: str,
+    balance_method: str,
+    calibration_method: str,
+    actual_long: int,
+    actual_short: int,
+    actual_label: str,
+) -> dict[str, Any]:
+    score = build_trade_score(
+        source,
+        long_prob,
+        short_prob,
+        confidence_threshold=confidence_threshold,
+        target_threshold=target_threshold,
+    )
+    score_data = score_to_dict(score)
+    return {
+        "timestamp": source["timestamp"],
+        "symbol": source["symbol"],
+        "predicted_class": predicted_class,
+        "predicted_label": predicted_class,
+        "predicted_direction": "up" if score.side == "LONG" else ("down" if score.side == "SHORT" else "flat"),
+        "side": score.side,
+        "probability": confidence,
+        "confidence": confidence,
+        "long_probability": float(long_prob),
+        "short_probability": float(short_prob),
+        "signal_score": float(signal_score),
+        "regime_score": float(regime_score),
+        "feature_stability_score": float(feature_stability_score),
+        "liquidity_score": 0.10 if float(source.get("vol_24h", 0.0)) > 0 else -0.25,
+        "close": float(source["close"]),
+        "future_return": float(source.get(f"future_return_{horizon}", 0.0) or 0.0),
+        "future_max_up": float(source.get(f"future_max_up_{horizon}", 0.0) or 0.0),
+        "future_max_down": float(source.get(f"future_max_down_{horizon}", 0.0) or 0.0),
+        "actual_long": int(actual_long),
+        "actual_short": int(actual_short),
+        "actual_label": actual_label,
+        "horizon": horizon,
+        "target_threshold": target_threshold,
+        "confidence_threshold": confidence_threshold,
+        "feature_set": feature_set,
+        "balance_method": balance_method,
+        "calibration_method": calibration_method,
+        "model_version": "dual_setup_v0.3_edge_score",
+        **score_data,
+    }
+
+
 def walk_forward(
     df: pd.DataFrame,
     horizon: str = "4h",
@@ -210,35 +274,26 @@ def walk_forward(
                 confidence_threshold,
             )
             rows.append(
-                {
-                    "timestamp": source["timestamp"],
-                    "symbol": source["symbol"],
-                    "predicted_class": predicted_class,
-                    "predicted_label": predicted_class,
-                    "predicted_direction": direction,
-                    "probability": confidence,
-                    "confidence": confidence,
-                    "long_probability": float(long_prob),
-                    "short_probability": float(short_prob),
-                    "signal_score": float(signal_score),
-                    "regime_score": float(regime_score),
-                    "feature_stability_score": float(feature_stability_score),
-                    "liquidity_score": 0.10 if float(source.get("vol_24h", 0.0)) > 0 else -0.25,
-                    "close": float(source["close"]),
-                    "future_return": float(source[f"future_return_{horizon}"]),
-                    "future_max_up": float(source[f"future_max_up_{horizon}"]),
-                    "future_max_down": float(source[f"future_max_down_{horizon}"]),
-                    "actual_long": int(a_long),
-                    "actual_short": int(a_short),
-                    "actual_label": "LONG_SETUP" if a_long else ("SHORT_SETUP" if a_short else "NO_TRADE"),
-                    "horizon": horizon,
-                    "target_threshold": target_threshold,
-                    "confidence_threshold": confidence_threshold,
-                    "feature_set": feature_set,
-                    "balance_method": balance_method,
-                    "calibration_method": calibration_method,
-                    "model_version": "dual_setup_v0.2",
-                }
+                _prediction_row(
+                    source,
+                    float(long_prob),
+                    float(short_prob),
+                    predicted_class,
+                    direction,
+                    confidence,
+                    signal_score,
+                    regime_score,
+                    feature_stability_score,
+                    horizon,
+                    target_threshold,
+                    confidence_threshold,
+                    feature_set,
+                    balance_method,
+                    calibration_method,
+                    int(a_long),
+                    int(a_short),
+                    "BOTH_SETUP" if a_long and a_short else ("LONG_SETUP" if a_long else ("SHORT_SETUP" if a_short else "NO_TRADE")),
+                )
             )
 
     if long_result is None:
@@ -246,12 +301,14 @@ def walk_forward(
     if short_result is None:
         short_result = SetupModelResult(_make_base_model(balance_method), features, horizon, target_threshold, balance_method, calibration_method, 0.0)
     predictions = pd.DataFrame(rows)
+    predictions, edge_policy = _apply_empirical_edge_gate(predictions)
     metrics = {
         "walk_forward_accuracy": float(np.mean(accuracies)) if accuracies else 0.0,
-        "signals": float((predictions["predicted_direction"] != "flat").sum()) if not predictions.empty else 0.0,
+        "signals": float((predictions["side"].astype(str).isin(["LONG", "SHORT"])).sum()) if not predictions.empty and "side" in predictions else 0.0,
         "long_opportunities": float((predictions["long_probability"] >= confidence_threshold).sum()) if not predictions.empty else 0.0,
         "short_opportunities": float((predictions["short_probability"] >= confidence_threshold).sum()) if not predictions.empty else 0.0,
-        "always_no_trade": float((predictions["predicted_direction"] == "flat").mean()) if not predictions.empty else 1.0,
+        "always_no_trade": float((predictions["side"].astype(str) == "NO_TRADE").mean()) if not predictions.empty and "side" in predictions else 1.0,
+        **edge_policy,
     }
     return predictions, metrics, long_result, short_result, features
 
@@ -293,6 +350,40 @@ Calibration methods supported: `sigmoid` via `CalibratedClassifierCV` and `isoto
 {curve.to_string()}
 """
     (REPORTS_DIR / "calibration_report.md").write_text(text, encoding="utf-8")
+
+
+def _apply_empirical_edge_gate(predictions: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float | str]]:
+    if predictions.empty or "side" not in predictions:
+        return predictions, {}
+    out = predictions.copy()
+    validation = out[out.get("actual_label", pd.Series(dtype=str)).astype(str) != "UNKNOWN_LIVE"].copy()
+    policy: dict[str, float | str] = {}
+    blocked_sides: set[str] = set()
+    for side, actual_col in {"LONG": "actual_long", "SHORT": "actual_short"}.items():
+        selected = validation[validation["side"].astype(str) == side].copy()
+        signed_return = pd.Series(dtype="float64")
+        if not selected.empty and "future_return" in selected:
+            raw_return = pd.to_numeric(selected["future_return"], errors="coerce")
+            signed_return = raw_return if side == "LONG" else -raw_return
+            signed_return = signed_return - LAB_CONFIG.fee_pct * 2 - LAB_CONFIG.slippage_pct
+        samples = int(len(selected))
+        precision = float(pd.to_numeric(selected.get(actual_col, pd.Series(dtype=float)), errors="coerce").fillna(0).eq(1).mean()) if samples else 0.0
+        expectancy = float(signed_return.dropna().mean()) if not signed_return.dropna().empty else 0.0
+        policy[f"{side.lower()}_samples"] = samples
+        policy[f"{side.lower()}_precision"] = precision
+        policy[f"{side.lower()}_expectancy"] = expectancy
+        if samples < MIN_EDGE_SAMPLES or precision < MIN_EDGE_PRECISION or expectancy <= 0:
+            blocked_sides.add(side)
+            policy[f"{side.lower()}_edge"] = "blocked"
+        else:
+            policy[f"{side.lower()}_edge"] = "allowed"
+    if blocked_sides:
+        mask = out["side"].astype(str).isin(blocked_sides)
+        out.loc[mask, "reason"] = out.loc[mask, "reason"].astype(str) + "; INSUFFICIENT_EMPIRICAL_EDGE"
+        out.loc[mask, "side"] = "NO_TRADE"
+        out.loc[mask, "predicted_direction"] = "flat"
+        out.loc[mask, "position_size"] = 0.0
+    return out, policy
 
 
 def save_feature_importance(model_result: SetupModelResult, filename: str) -> None:
@@ -351,38 +442,36 @@ def train(
                 confidence_threshold,
             )
             live_rows.append(
-                {
-                    "timestamp": source["timestamp"],
-                    "symbol": source["symbol"],
-                    "predicted_class": predicted_class,
-                    "predicted_label": predicted_class,
-                    "predicted_direction": direction,
-                    "probability": confidence,
-                    "confidence": confidence,
-                    "long_probability": float(long_prob),
-                    "short_probability": float(short_prob),
-                    "signal_score": float(signal_score),
-                    "regime_score": float(regime_score),
-                    "feature_stability_score": float(feature_stability_score),
-                    "liquidity_score": 0.10 if float(source.get("vol_24h", 0.0)) > 0 else -0.25,
-                    "close": float(source["close"]),
-                    "future_return": float(source.get(f"future_return_{horizon}", 0.0) or 0.0),
-                    "future_max_up": float(source.get(f"future_max_up_{horizon}", 0.0) or 0.0),
-                    "future_max_down": float(source.get(f"future_max_down_{horizon}", 0.0) or 0.0),
-                    "actual_long": 0,
-                    "actual_short": 0,
-                    "actual_label": "UNKNOWN_LIVE",
-                    "horizon": horizon,
-                    "target_threshold": target_threshold,
-                    "confidence_threshold": confidence_threshold,
-                    "feature_set": "full",
-                    "balance_method": balance_method,
-                    "calibration_method": calibration_method,
-                    "model_version": "dual_setup_v0.2",
-                }
+                _prediction_row(
+                    source,
+                    float(long_prob),
+                    float(short_prob),
+                    predicted_class,
+                    direction,
+                    confidence,
+                    signal_score,
+                    regime_score,
+                    feature_stability_score,
+                    horizon,
+                    target_threshold,
+                    confidence_threshold,
+                    "full",
+                    balance_method,
+                    calibration_method,
+                    0,
+                    0,
+                    "UNKNOWN_LIVE",
+                )
             )
     if live_rows:
         predictions = pd.concat([predictions, pd.DataFrame(live_rows)], ignore_index=True)
+    predictions, edge_policy = _apply_empirical_edge_gate(predictions)
+    metrics = {
+        **metrics,
+        "signals": float((predictions["side"].astype(str).isin(["LONG", "SHORT"])).sum()) if not predictions.empty and "side" in predictions else 0.0,
+        "always_no_trade": float((predictions["side"].astype(str) == "NO_TRADE").mean()) if not predictions.empty and "side" in predictions else 1.0,
+        **edge_policy,
+    }
     joblib.dump(LongSetupModel(long_result), MODELS_DIR / "long_model.pkl")
     joblib.dump(ShortSetupModel(short_result), MODELS_DIR / "short_model.pkl")
     joblib.dump(
@@ -390,7 +479,7 @@ def train(
             "long_model": long_result,
             "short_model": short_result,
             "metrics": metrics,
-            "model_version": "dual_setup_v0.2",
+            "model_version": "dual_setup_v0.3_edge_score",
         },
         MODELS_DIR / "dual_setup_v0.2.joblib",
     )

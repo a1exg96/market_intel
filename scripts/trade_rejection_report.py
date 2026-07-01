@@ -43,8 +43,22 @@ def _load_regimes() -> pd.DataFrame:
 def rejection_reason(row: pd.Series, threshold: float = LAB_CONFIG.confidence_threshold) -> str:
     predicted_class = str(row.get("predicted_class", row.get("predicted_label", "")))
     confidence = float(row.get("confidence", 0.0))
+    side = str(row.get("side", "")).upper()
+    score_reason = str(row.get("reason", "")).upper()
     if pd.isna(row.get("future_return_if_available", row.get("future_return", 0.0))):
         return "DATA_MISSING"
+    if side == "NO_TRADE" and score_reason:
+        for reason in [
+            "NON_POSITIVE_EXPECTANCY",
+            "LOW_RISK_REWARD",
+            "EXTREME_VOLATILITY",
+            "STOP_TOO_CLOSE_TO_LIQUIDATION",
+            "INSUFFICIENT_EMPIRICAL_EDGE",
+            "REGIME_BLOCKED",
+            "LOW_CONFIDENCE",
+        ]:
+            if reason in score_reason:
+                return reason
     if predicted_class in {"NO_TRADE", "no_trade", "flat", ""}:
         return "PREDICTED_NO_TRADE"
     if confidence < threshold:
