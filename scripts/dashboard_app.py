@@ -307,7 +307,27 @@ def logout() -> RedirectResponse:
 
 @app.get("/api/stats")
 def api_stats() -> dict[str, Any]:
-    return _with_kyiv_times(stats_snapshot())
+    try:
+        return _with_kyiv_times(stats_snapshot())
+    except Exception as exc:
+        return _with_kyiv_times(
+            {
+                "balance": 0.0,
+                "equity": 0.0,
+                "realized_pnl": 0.0,
+                "unrealized_pnl": 0.0,
+                "trades_count": 0,
+                "open_positions_count": 0,
+                "wins": 0,
+                "losses": 0,
+                "winrate": 0.0,
+                "profit_factor": 0.0,
+                "max_drawdown": 0.0,
+                "last_update": datetime.now(timezone.utc).isoformat(),
+                "status": "error",
+                "error": str(exc),
+            }
+        )
 
 
 @app.get("/api/active-positions")

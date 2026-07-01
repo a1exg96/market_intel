@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -108,8 +108,10 @@ def load_paper_trading_config(path: Path | None = None) -> PaperTradingConfig:
         raise RuntimeError("ERROR: live_trading=true is forbidden. Paper engine refuses to start.")
     if config.leverage <= 0:
         raise RuntimeError("ERROR: leverage must be positive.")
-    if not 0 < config.risk_per_trade <= 0.01:
-        raise RuntimeError("ERROR: risk_per_trade must be between 0 and 0.01.")
+    if config.risk_per_trade <= 0:
+        raise RuntimeError("ERROR: risk_per_trade must be positive.")
+    if config.risk_per_trade > 0.01:
+        config = replace(config, risk_per_trade=0.01)
     if config.liquidation_long_pct <= 0 or config.liquidation_short_pct <= 0:
         raise RuntimeError("ERROR: liquidation percentages must be positive.")
     return config

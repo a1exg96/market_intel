@@ -389,6 +389,18 @@ class PaperExecutionTest(unittest.TestCase):
             self.assertEqual(config.liquidation_long_pct, 3.1)
             self.assertEqual(config.liquidation_short_pct, 4.2)
 
+    def test_legacy_risk_above_one_percent_is_clamped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "paper_trading.yaml"
+            config_path.write_text(
+                "live_trading: false\ninitial_balance: 1000.0\nrisk_per_trade: 0.025\n",
+                encoding="utf-8",
+            )
+
+            config = pe.load_paper_trading_config(config_path)
+
+            self.assertEqual(config.risk_per_trade, 0.01)
+
     def test_leverage_multiplies_unrealized_pnl_and_stop_loss_prevents_liquidation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp)
