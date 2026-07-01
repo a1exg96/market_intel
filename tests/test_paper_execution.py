@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import os
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -90,6 +92,24 @@ class PaperExecutionTest(unittest.TestCase):
                 self.assertEqual(signals.iloc[1]["symbol"], "ETHUSDT")
             finally:
                 pe.SIGNALS_PATH = original_path
+
+    def test_stale_paper_state_lock_is_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reports = Path(tmp)
+            original = (pe.LOCK_PATH, pe.STALE_LOCK_SECONDS)
+            pe.LOCK_PATH = reports / ".paper_execution.lock"
+            pe.STALE_LOCK_SECONDS = 1
+            try:
+                pe.LOCK_PATH.mkdir()
+                old_time = time.time() - 10
+                os.utime(pe.LOCK_PATH, (old_time, old_time))
+
+                with pe._paper_state_lock():
+                    self.assertTrue(pe.LOCK_PATH.exists())
+
+                self.assertFalse(pe.LOCK_PATH.exists())
+            finally:
+                pe.LOCK_PATH, pe.STALE_LOCK_SECONDS = original
 
     def test_short_signal_opens_position_without_closing_trade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -56,6 +56,8 @@ AUDIT_PATH = REPORTS_DIR / "signal_execution_audit.csv"
 SIGNALS_PATH = REPORTS_DIR / "forward_signals.csv"
 LOCK_PATH = REPORTS_DIR / ".paper_execution.lock"
 _LOCAL_LOCK = threading.RLock()
+LOCK_TIMEOUT_SECONDS = 10
+STALE_LOCK_SECONDS = 120
 
 
 @dataclass(frozen=True)
@@ -112,12 +114,15 @@ def _read_csv(path: Path, columns: list[str]) -> pd.DataFrame:
 def _paper_state_lock() -> Any:
     ensure_dirs()
     with _LOCAL_LOCK:
-        deadline = time.time() + 10
+        deadline = time.time() + LOCK_TIMEOUT_SECONDS
         while True:
             try:
                 LOCK_PATH.mkdir()
                 break
             except FileExistsError:
+                if _lock_is_stale():
+                    _remove_stale_lock()
+                    continue
                 if time.time() >= deadline:
                     raise RuntimeError(f"Timed out waiting for paper state lock: {LOCK_PATH}")
                 time.sleep(0.05)
@@ -128,6 +133,25 @@ def _paper_state_lock() -> Any:
                 LOCK_PATH.rmdir()
             except FileNotFoundError:
                 pass
+
+
+def _lock_is_stale() -> bool:
+    try:
+        age = time.time() - LOCK_PATH.stat().st_mtime
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return age > STALE_LOCK_SECONDS
+
+
+def _remove_stale_lock() -> None:
+    try:
+        LOCK_PATH.rmdir()
+    except FileNotFoundError:
+        return
+    except OSError:
+        return
 
 
 def read_active_positions(open_only: bool = False) -> pd.DataFrame:

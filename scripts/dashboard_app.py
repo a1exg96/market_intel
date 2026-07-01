@@ -211,20 +211,13 @@ def startup() -> None:
 
 @app.get("/health")
 def health() -> dict[str, Any]:
-    try:
-        stats = stats_snapshot()
-        csv_state = "ok"
-    except Exception as exc:
-        stats = {}
-        csv_state = f"error: {exc}"
     return {
         "collector_status": "see local logs",
         "research_status": "see local logs",
-        "csv_state": csv_state,
+        "csv_state": "not_checked",
         "redis_status": redis_status(),
         "uptime_seconds": int(time.time() - STARTED_AT),
         "last_update": datetime.now(KYIV_TZ).isoformat(),
-        "stats": _with_kyiv_times(stats),
     }
 
 
