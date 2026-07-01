@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import os
 import time
+import math
 from pathlib import Path
 
 import pandas as pd
@@ -58,6 +59,12 @@ class PaperExecutionTest(unittest.TestCase):
                 self.assertEqual(pe.latest_local_prices()["BTCUSDT"], 58704.0)
             finally:
                 pe.RAW_DIR, pe.PROCESSED_DIR = original_dirs
+
+    def test_records_converts_nan_to_json_safe_none(self) -> None:
+        rows = pe.records(pd.DataFrame([{"symbol": "BTCUSDT", "expected_return": float("nan")}]))
+
+        self.assertIsNone(rows[0]["expected_return"])
+        self.assertFalse(any(isinstance(value, float) and math.isnan(value) for value in rows[0].values()))
 
     def test_read_signals_deduplicates_timestamp_symbol_and_sorts_latest(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

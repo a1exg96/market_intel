@@ -842,5 +842,5 @@ def stats_snapshot() -> dict[str, Any]:
 def records(frame: pd.DataFrame) -> list[dict[str, Any]]:
     if frame.empty:
         return []
-    clean = frame.where(pd.notna(frame), None)
+    clean = frame.astype(object).where(pd.notna(frame), None)
     return clean.to_dict(orient="records")
