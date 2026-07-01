@@ -102,6 +102,23 @@ services:
       timeout: 5s
       retries: 5
 
+  telegram-notifier:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./configs:/app/configs
+    depends_on:
+      research:
+        condition: service_started
+    command: python scripts/main.py telegram-notifier-service
+
 volumes:
   postgres_data:
   redis_data:

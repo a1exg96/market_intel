@@ -116,6 +116,7 @@ def main(argv: list[str] | None = None) -> int:
             "paper",
             "research",
             "research-service",
+            "telegram-notifier-service",
             "dashboard",
             "adapt",
             "report",
@@ -145,6 +146,12 @@ def main(argv: list[str] | None = None) -> int:
         from scripts.research_service import run_research_service
 
         run_research_service()
+        return 0
+
+    if args.command == "telegram-notifier-service":
+        from scripts.telegram_notifier import run_telegram_notifier_service
+
+        run_telegram_notifier_service()
         return 0
 
     if args.command == "dashboard":

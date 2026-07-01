@@ -141,6 +141,12 @@ View collector logs:
 docker compose logs -f collector
 ```
 
+View Telegram notifier logs:
+
+```bash
+docker compose logs -f telegram-notifier
+```
+
 Restart all services:
 
 ```bash
@@ -172,3 +178,40 @@ tar -czf market-intel-files-backup.tar.gz data models configs
 ```
 
 Docker volume backup can be added after the first production run, once the exact server path and backup destination are chosen.
+
+## 9. Telegram Signal Notifications
+
+Create a bot in Telegram:
+
+1. Open `@BotFather`.
+2. Run `/newbot`.
+3. Copy the bot token.
+4. Send any message to your new bot from your Telegram account.
+5. Open this URL in a browser, replacing the token:
+
+```text
+https://api.telegram.org/botBOT_TOKEN/getUpdates
+```
+
+Find your numeric `chat.id`, then update `.env` on the server:
+
+```text
+TELEGRAM_NOTIFICATIONS_ENABLED=true
+TELEGRAM_BOT_TOKEN=BOT_TOKEN
+TELEGRAM_CHAT_ID=YOUR_CHAT_ID
+TELEGRAM_MIN_CONFIDENCE=0.60
+TELEGRAM_NOTIFIER_INTERVAL_SECONDS=5
+```
+
+Restart the notifier:
+
+```bash
+docker compose up -d --build telegram-notifier
+docker compose logs -f telegram-notifier
+```
+
+The notifier sends one message per opened paper position when `signal_execution_audit.csv` contains `executed=True`, `reason=OPENED`, and confidence is at least `TELEGRAM_MIN_CONFIDENCE`. Sent notifications are tracked in:
+
+```text
+data/reports/telegram_notifications.csv
+```

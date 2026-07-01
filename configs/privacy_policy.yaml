@@ -9,6 +9,7 @@ allowed_domains:
   - okx.com
   - coinbase.com
   - kraken.com
+  - api.telegram.org
 disabled_by_default:
   - telegram
   - discord
@@ -19,4 +20,3 @@ disabled_by_default:
 optional_integrations:
   news_api_enabled: false
   onchain_api_enabled: false
-
