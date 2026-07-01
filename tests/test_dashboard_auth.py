@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import os
 import unittest
+import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
 
-from scripts.dashboard_app import _check_dashboard_access, _create_session_token, _session_username
+from scripts.dashboard_app import _check_dashboard_access, _create_session_token, _session_username, _with_kyiv_times
 
 
 def _request(ip: str = "127.0.0.1") -> SimpleNamespace:
@@ -15,6 +16,14 @@ def _request(ip: str = "127.0.0.1") -> SimpleNamespace:
 
 
 class DashboardAuthTest(unittest.TestCase):
+    def test_dashboard_payload_converts_non_finite_numbers_to_none(self) -> None:
+        payload = _with_kyiv_times({"profit_factor": float("inf"), "bad": float("nan"), "balance": 1000.0})
+
+        self.assertIsNone(payload["profit_factor"])
+        self.assertIsNone(payload["bad"])
+        self.assertEqual(payload["balance"], 1000.0)
+        self.assertFalse(any(isinstance(value, float) and math.isnan(value) for value in payload.values()))
+
     def test_session_token_roundtrip(self) -> None:
         with patch.dict(
             os.environ,

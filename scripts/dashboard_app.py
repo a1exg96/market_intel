@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 import hashlib
 import hmac
+import math
 import os
 import secrets
 from urllib.parse import parse_qs
@@ -174,8 +175,20 @@ def _to_kyiv_time(value: Any) -> Any:
     return dt.astimezone(KYIV_TZ).isoformat()
 
 
+def _json_safe(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    return value
+
+
 def _with_kyiv_times(item: dict[str, Any]) -> dict[str, Any]:
-    return {key: _to_kyiv_time(value) if key in TIME_FIELDS else value for key, value in item.items()}
+    return _json_safe({key: _to_kyiv_time(value) if key in TIME_FIELDS else value for key, value in item.items()})
 
 
 def _records_kyiv(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
