@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import os
 import unittest
-import base64
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from fastapi import HTTPException
-from fastapi.security import HTTPBasicCredentials
 
-from scripts.dashboard_app import _basic_credentials_from_header, require_dashboard_access
+from scripts.dashboard_app import _check_dashboard_access, _create_session_token, _session_username
 
 
 def _request(ip: str = "127.0.0.1") -> SimpleNamespace:
@@ -17,25 +15,32 @@ def _request(ip: str = "127.0.0.1") -> SimpleNamespace:
 
 
 class DashboardAuthTest(unittest.TestCase):
-    def test_basic_credentials_are_parsed_from_header(self) -> None:
-        token = base64.b64encode(b"admin:secret-dashboard-password").decode("ascii")
+    def test_session_token_roundtrip(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"DASHBOARD_PASSWORD": "secret-dashboard-password", "DASHBOARD_SESSION_SECONDS": "86400"},
+            clear=False,
+        ):
+            token = _create_session_token("admin", issued_at=1000)
 
-        credentials = _basic_credentials_from_header(f"Basic {token}")
+            self.assertEqual(_session_username(token, now=1001), "admin")
 
-        self.assertEqual(credentials, ("admin", "secret-dashboard-password"))
+    def test_expired_session_token_is_rejected(self) -> None:
+        with patch.dict(
+            os.environ,
+            {"DASHBOARD_PASSWORD": "secret-dashboard-password", "DASHBOARD_SESSION_SECONDS": "10"},
+            clear=False,
+        ):
+            token = _create_session_token("admin", issued_at=1000)
 
-    def test_invalid_basic_credentials_header_is_rejected(self) -> None:
-        self.assertIsNone(_basic_credentials_from_header(None))
-        self.assertIsNone(_basic_credentials_from_header("Bearer token"))
-        self.assertIsNone(_basic_credentials_from_header("Basic not-base64"))
+            self.assertIsNone(_session_username(token, now=1011))
 
     def test_dashboard_requires_configured_password(self) -> None:
         with patch.dict(os.environ, {"DASHBOARD_USERNAME": "admin"}, clear=False):
             os.environ.pop("DASHBOARD_PASSWORD", None)
-            credentials = HTTPBasicCredentials(username="admin", password="anything")
 
             with self.assertRaises(HTTPException) as ctx:
-                require_dashboard_access(_request(), credentials)
+                _check_dashboard_access(_request(), "admin", "anything")
 
             self.assertEqual(ctx.exception.status_code, 503)
 
@@ -45,9 +50,7 @@ class DashboardAuthTest(unittest.TestCase):
             {"DASHBOARD_USERNAME": "admin", "DASHBOARD_PASSWORD": "secret-dashboard-password"},
             clear=False,
         ):
-            credentials = HTTPBasicCredentials(username="admin", password="secret-dashboard-password")
-
-            user = require_dashboard_access(_request(), credentials)
+            user = _check_dashboard_access(_request(), "admin", "secret-dashboard-password")
 
             self.assertEqual(user, "admin")
 
@@ -61,10 +64,8 @@ class DashboardAuthTest(unittest.TestCase):
             },
             clear=False,
         ):
-            credentials = HTTPBasicCredentials(username="admin", password="secret-dashboard-password")
-
             with self.assertRaises(HTTPException) as ctx:
-                require_dashboard_access(_request("127.0.0.1"), credentials)
+                _check_dashboard_access(_request("127.0.0.1"), "admin", "secret-dashboard-password")
 
             self.assertEqual(ctx.exception.status_code, 403)
 

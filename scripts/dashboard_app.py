@@ -1,17 +1,17 @@
 from __future__ import annotations
 
 import time
-import base64
+import hashlib
+import hmac
 import os
 import secrets
-import binascii
+from urllib.parse import parse_qs
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from scripts.cache import redis_status
 from scripts.common import RAW_DIR, LAB_CONFIG, read_parquet
@@ -30,8 +30,8 @@ STARTED_AT = time.time()
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 TIME_FIELDS = {"timestamp", "ts", "opened_at", "closed_at", "last_update", "updated_at", "generated_at"}
 app = FastAPI(title="Market Intelligence Dashboard", version="0.1", docs_url=None, redoc_url=None, openapi_url=None)
-security = HTTPBasic()
-PUBLIC_PATHS = {"/health"}
+PUBLIC_PATHS = {"/health", "/login"}
+DASHBOARD_SESSION_COOKIE = "market_intel_dashboard_session"
 
 
 def _dashboard_user() -> str:
@@ -42,29 +42,50 @@ def _dashboard_password() -> str:
     return os.getenv("DASHBOARD_PASSWORD", "")
 
 
+def _dashboard_session_secret() -> str:
+    return os.getenv("DASHBOARD_SESSION_SECRET") or _dashboard_password()
+
+
+def _dashboard_session_seconds() -> int:
+    try:
+        return int(os.getenv("DASHBOARD_SESSION_SECONDS", "86400"))
+    except ValueError:
+        return 86400
+
+
+def _dashboard_cookie_secure() -> bool:
+    return os.getenv("DASHBOARD_COOKIE_SECURE", "").lower() in {"1", "true", "yes", "on"}
+
+
 def _allowed_dashboard_ips() -> set[str]:
     raw = os.getenv("DASHBOARD_ALLOWED_IPS", "")
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
 def _dashboard_auth_error(status_code: int, detail: str) -> HTTPException:
-    headers = {"WWW-Authenticate": "Basic"} if status_code == status.HTTP_401_UNAUTHORIZED else None
-    return HTTPException(status_code=status_code, detail=detail, headers=headers)
+    return HTTPException(status_code=status_code, detail=detail)
 
 
-def _check_dashboard_access(request: Request, username: str, password_value: str) -> str:
-    password = _dashboard_password()
-    if not password:
+def _require_dashboard_password_configured() -> str:
+    configured_password = _dashboard_password()
+    if not configured_password:
         raise _dashboard_auth_error(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Dashboard access is not configured. Set DASHBOARD_PASSWORD in .env.",
         )
+    return configured_password
 
+
+def _check_dashboard_ip(request: Request) -> None:
     allowed_ips = _allowed_dashboard_ips()
     client_ip = request.client.host if request.client else ""
     if allowed_ips and client_ip not in allowed_ips:
         raise _dashboard_auth_error(status.HTTP_403_FORBIDDEN, "IP address is not allowed.")
 
+
+def _check_dashboard_access(request: Request, username: str, password_value: str) -> str:
+    password = _require_dashboard_password_configured()
+    _check_dashboard_ip(request)
     username_ok = secrets.compare_digest(username, _dashboard_user())
     password_ok = secrets.compare_digest(password_value, password)
     if not (username_ok and password_ok):
@@ -72,22 +93,45 @@ def _check_dashboard_access(request: Request, username: str, password_value: str
     return username
 
 
-def require_dashboard_access(request: Request, credentials: HTTPBasicCredentials = Depends(security)) -> str:
-    return _check_dashboard_access(request, credentials.username, credentials.password)
+def _session_signature(message: str) -> str:
+    secret = _dashboard_session_secret()
+    return hmac.new(secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _basic_credentials_from_header(authorization: str | None) -> tuple[str, str] | None:
-    if not authorization or not authorization.lower().startswith("basic "):
+def _create_session_token(username: str, issued_at: int | None = None) -> str:
+    _require_dashboard_password_configured()
+    issued = int(issued_at if issued_at is not None else time.time())
+    message = f"{username}:{issued}"
+    return f"{message}:{_session_signature(message)}"
+
+
+def _session_username(token: str | None, now: int | None = None) -> str | None:
+    if not token:
         return None
-    token = authorization.split(" ", 1)[1].strip()
+    parts = token.split(":")
+    if len(parts) != 3:
+        return None
+    username, issued_raw, signature = parts
     try:
-        decoded = base64.b64decode(token, validate=True).decode("utf-8")
-    except (binascii.Error, UnicodeDecodeError):
+        issued = int(issued_raw)
+    except ValueError:
         return None
-    if ":" not in decoded:
+
+    message = f"{username}:{issued}"
+    if not secrets.compare_digest(signature, _session_signature(message)):
         return None
-    username, password_value = decoded.split(":", 1)
-    return username, password_value
+
+    session_seconds = _dashboard_session_seconds()
+    current_time = int(now if now is not None else time.time())
+    if session_seconds > 0 and current_time - issued > session_seconds:
+        return None
+    return username
+
+
+def _auth_failure_response(request: Request, status_code: int, detail: str) -> JSONResponse | RedirectResponse:
+    if request.url.path.startswith("/api/"):
+        return JSONResponse(status_code=status_code, content={"detail": detail})
+    return RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
 
 
 @app.middleware("http")
@@ -95,22 +139,19 @@ async def dashboard_auth_middleware(request: Request, call_next: Any) -> Any:
     if request.url.path in PUBLIC_PATHS:
         return await call_next(request)
 
-    credentials = _basic_credentials_from_header(request.headers.get("authorization"))
-    if credentials is None:
-        return JSONResponse(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            content={"detail": "Dashboard credentials are required."},
-            headers={"WWW-Authenticate": "Basic"},
-        )
-
     try:
-        _check_dashboard_access(request, credentials[0], credentials[1])
+        _require_dashboard_password_configured()
+        _check_dashboard_ip(request)
     except HTTPException as exc:
         return JSONResponse(
             status_code=exc.status_code,
             content={"detail": exc.detail},
             headers=exc.headers or {},
         )
+
+    username = _session_username(request.cookies.get(DASHBOARD_SESSION_COOKIE))
+    if username != _dashboard_user():
+        return _auth_failure_response(request, status.HTTP_401_UNAUTHORIZED, "Dashboard login is required.")
 
     return await call_next(request)
 
@@ -187,38 +228,106 @@ def health() -> dict[str, Any]:
     }
 
 
-@app.get("/api/stats", dependencies=[Depends(require_dashboard_access)])
+@app.get("/login", response_class=HTMLResponse)
+def login_page(error: str = "") -> str:
+    error_html = "<div class=\"error\">Невірний логін або пароль</div>" if error else ""
+    return f"""
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Вхід до dashboard</title>
+  <style>
+    :root {{ color-scheme: dark; --bg:#101419; --panel:#171c22; --line:#2b323b; --muted:#93a4b7; --text:#eef2f6; --red:#fb7185; --blue:#60a5fa; }}
+    * {{ box-sizing:border-box; }}
+    body {{ min-height:100vh; margin:0; display:grid; place-items:center; font-family:Arial, sans-serif; background:var(--bg); color:var(--text); }}
+    form {{ width:min(360px, calc(100vw - 28px)); background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:18px; display:grid; gap:10px; }}
+    h1 {{ margin:0 0 4px; font-size:18px; }}
+    p {{ margin:0 0 8px; color:var(--muted); font-size:12px; }}
+    label {{ color:var(--muted); font-size:11px; }}
+    input {{ width:100%; border:1px solid var(--line); border-radius:6px; background:#11161c; color:var(--text); padding:9px 10px; font-size:14px; }}
+    button {{ border:0; border-radius:6px; background:var(--blue); color:#06111f; padding:9px 10px; font-weight:700; cursor:pointer; }}
+    .error {{ border:1px solid #6d1d2a; background:#35131a; color:var(--red); border-radius:6px; padding:8px; font-size:12px; }}
+  </style>
+</head>
+<body>
+  <form method="post" action="/login" autocomplete="off">
+    <h1>Вхід</h1>
+    <p>Після закриття браузера сесія dashboard завершиться.</p>
+    {error_html}
+    <label for="username">Логін</label>
+    <input id="username" name="username" required autofocus />
+    <label for="password">Пароль</label>
+    <input id="password" name="password" type="password" required />
+    <button type="submit">Увійти</button>
+  </form>
+</body>
+</html>
+"""
+
+
+@app.post("/login")
+async def login(request: Request) -> RedirectResponse:
+    body = (await request.body()).decode("utf-8")
+    form = parse_qs(body)
+    username = form.get("username", [""])[0]
+    password = form.get("password", [""])[0]
+    try:
+        _check_dashboard_access(request, username, password)
+    except HTTPException:
+        return RedirectResponse(url="/login?error=1", status_code=status.HTTP_303_SEE_OTHER)
+
+    response = RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+    response.set_cookie(
+        DASHBOARD_SESSION_COOKIE,
+        _create_session_token(username),
+        httponly=True,
+        secure=_dashboard_cookie_secure(),
+        samesite="lax",
+    )
+    return response
+
+
+@app.get("/logout")
+def logout() -> RedirectResponse:
+    response = RedirectResponse(url="/login", status_code=status.HTTP_303_SEE_OTHER)
+    response.delete_cookie(DASHBOARD_SESSION_COOKIE)
+    return response
+
+
+@app.get("/api/stats")
 def api_stats() -> dict[str, Any]:
     return _with_kyiv_times(stats_snapshot())
 
 
-@app.get("/api/active-positions", dependencies=[Depends(require_dashboard_access)])
+@app.get("/api/active-positions")
 def api_active_positions() -> list[dict[str, Any]]:
     stats_snapshot()
     return _records_kyiv(records(read_active_positions(open_only=True)))
 
 
-@app.get("/api/trades", dependencies=[Depends(require_dashboard_access)])
+@app.get("/api/trades")
 def api_trades() -> list[dict[str, Any]]:
     return _records_kyiv(records(read_trades().tail(100).iloc[::-1].reset_index(drop=True)))
 
 
-@app.get("/api/signals", dependencies=[Depends(require_dashboard_access)])
+@app.get("/api/signals")
 def api_signals() -> list[dict[str, Any]]:
     return _records_kyiv(records(read_signals(limit=100).iloc[::-1].reset_index(drop=True)))
 
 
-@app.get("/api/signal-execution-audit", dependencies=[Depends(require_dashboard_access)])
+@app.get("/api/signal-execution-audit")
 def api_signal_execution_audit() -> list[dict[str, Any]]:
     return _records_kyiv(records(read_audit().tail(100).iloc[::-1].reset_index(drop=True)))
 
 
-@app.get("/api/market-prices", dependencies=[Depends(require_dashboard_access)])
+@app.get("/api/market-prices")
 def api_market_prices() -> list[dict[str, Any]]:
     return _market_price_rows()
 
 
-@app.get("/api/summary", dependencies=[Depends(require_dashboard_access)])
+@app.get("/api/summary")
 def summary() -> dict[str, Any]:
     signals = api_signals()
     audit = api_signal_execution_audit()
@@ -239,7 +348,7 @@ def summary() -> dict[str, Any]:
     }
 
 
-@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_dashboard_access)])
+@app.get("/", response_class=HTMLResponse)
 def index() -> str:
     return """
 <!doctype html>
@@ -253,6 +362,8 @@ def index() -> str:
     * { box-sizing:border-box; }
     body { margin:0; font-family:Arial, sans-serif; background:var(--bg); color:var(--text); }
     header { padding:8px 14px; border-bottom:1px solid var(--line); display:flex; justify-content:space-between; gap:12px; align-items:center; font-size:11px; }
+    header a { color:var(--muted); text-decoration:none; border:1px solid var(--line); border-radius:6px; padding:4px 7px; }
+    header a:hover { color:var(--text); }
     main { padding:10px 14px; display:grid; gap:10px; }
     .grid { display:grid; grid-template-columns:repeat(9, minmax(96px, 1fr)); gap:8px; }
     .twoCol { display:grid; grid-template-columns:minmax(240px, 0.82fr) minmax(340px, 1.18fr); gap:10px; align-items:start; }
@@ -297,7 +408,7 @@ def index() -> str:
 <body>
   <header>
     <strong>Лабораторія паперової торгівлі</strong>
-    <span id="updated">завантаження...</span>
+    <span><span id="updated">завантаження...</span> <a href="/logout">Вийти</a></span>
   </header>
   <main>
     <section class="grid">

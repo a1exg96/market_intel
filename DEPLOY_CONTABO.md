@@ -68,7 +68,13 @@ Use a strong value:
 ```text
 DASHBOARD_USERNAME=admin
 DASHBOARD_PASSWORD=PUT_A_LONG_PRIVATE_PASSWORD_HERE
+DASHBOARD_SESSION_SECONDS=86400
+DASHBOARD_COOKIE_SECURE=false
 ```
+
+The dashboard uses a browser session cookie. It is not written as a persistent cookie, so after closing the browser session the next dashboard visit asks for login again. Use the `Вийти` link to end the session immediately.
+
+Set `DASHBOARD_COOKIE_SECURE=true` only after the dashboard is behind HTTPS. Keep it `false` for plain `http://SERVER_IP:8000`, otherwise the browser will not send the cookie.
 
 Optional: restrict the dashboard to specific public IP addresses:
 
