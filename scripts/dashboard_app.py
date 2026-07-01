@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 import time
+import base64
 import os
 import secrets
+import binascii
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
-from fastapi.responses import HTMLResponse
 
 from scripts.cache import redis_status
 from scripts.common import RAW_DIR, LAB_CONFIG, read_parquet
@@ -27,8 +29,9 @@ from scripts.paper_execution import (
 STARTED_AT = time.time()
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 TIME_FIELDS = {"timestamp", "ts", "opened_at", "closed_at", "last_update", "updated_at", "generated_at"}
-app = FastAPI(title="Market Intelligence Dashboard", version="0.1")
+app = FastAPI(title="Market Intelligence Dashboard", version="0.1", docs_url=None, redoc_url=None, openapi_url=None)
 security = HTTPBasic()
+PUBLIC_PATHS = {"/health"}
 
 
 def _dashboard_user() -> str:
@@ -44,28 +47,72 @@ def _allowed_dashboard_ips() -> set[str]:
     return {item.strip() for item in raw.split(",") if item.strip()}
 
 
-def require_dashboard_access(request: Request, credentials: HTTPBasicCredentials = Depends(security)) -> str:
+def _dashboard_auth_error(status_code: int, detail: str) -> HTTPException:
+    headers = {"WWW-Authenticate": "Basic"} if status_code == status.HTTP_401_UNAUTHORIZED else None
+    return HTTPException(status_code=status_code, detail=detail, headers=headers)
+
+
+def _check_dashboard_access(request: Request, username: str, password_value: str) -> str:
     password = _dashboard_password()
     if not password:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Dashboard access is not configured. Set DASHBOARD_PASSWORD in .env.",
+        raise _dashboard_auth_error(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "Dashboard access is not configured. Set DASHBOARD_PASSWORD in .env.",
         )
 
     allowed_ips = _allowed_dashboard_ips()
     client_ip = request.client.host if request.client else ""
     if allowed_ips and client_ip not in allowed_ips:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="IP address is not allowed.")
+        raise _dashboard_auth_error(status.HTTP_403_FORBIDDEN, "IP address is not allowed.")
 
-    username_ok = secrets.compare_digest(credentials.username, _dashboard_user())
-    password_ok = secrets.compare_digest(credentials.password, password)
+    username_ok = secrets.compare_digest(username, _dashboard_user())
+    password_ok = secrets.compare_digest(password_value, password)
     if not (username_ok and password_ok):
-        raise HTTPException(
+        raise _dashboard_auth_error(status.HTTP_401_UNAUTHORIZED, "Invalid dashboard credentials.")
+    return username
+
+
+def require_dashboard_access(request: Request, credentials: HTTPBasicCredentials = Depends(security)) -> str:
+    return _check_dashboard_access(request, credentials.username, credentials.password)
+
+
+def _basic_credentials_from_header(authorization: str | None) -> tuple[str, str] | None:
+    if not authorization or not authorization.lower().startswith("basic "):
+        return None
+    token = authorization.split(" ", 1)[1].strip()
+    try:
+        decoded = base64.b64decode(token, validate=True).decode("utf-8")
+    except (binascii.Error, UnicodeDecodeError):
+        return None
+    if ":" not in decoded:
+        return None
+    username, password_value = decoded.split(":", 1)
+    return username, password_value
+
+
+@app.middleware("http")
+async def dashboard_auth_middleware(request: Request, call_next: Any) -> Any:
+    if request.url.path in PUBLIC_PATHS:
+        return await call_next(request)
+
+    credentials = _basic_credentials_from_header(request.headers.get("authorization"))
+    if credentials is None:
+        return JSONResponse(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid dashboard credentials.",
+            content={"detail": "Dashboard credentials are required."},
             headers={"WWW-Authenticate": "Basic"},
         )
-    return credentials.username
+
+    try:
+        _check_dashboard_access(request, credentials[0], credentials[1])
+    except HTTPException as exc:
+        return JSONResponse(
+            status_code=exc.status_code,
+            content={"detail": exc.detail},
+            headers=exc.headers or {},
+        )
+
+    return await call_next(request)
 
 
 def _to_kyiv_time(value: Any) -> Any:
