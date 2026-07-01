@@ -11,7 +11,7 @@ from scripts.baseline_ml import train
 from scripts.cache import publish_event
 from scripts.collector import collect
 from scripts.common import LAB_CONFIG, RAW_DIR, REPORTS_DIR, market_symbols, setup_logging
-from scripts.db import init_db, insert_daily_report, insert_signals, log_event
+from scripts.db import init_db, insert_daily_report, insert_signals, log_event, prune_runtime_tables
 from scripts.feature_engineering import build_features
 from scripts.forward_paper_engine import run_forward_paper_engine
 from scripts.regime_engine import build_regime_labels
@@ -70,6 +70,7 @@ def run_research_service() -> None:
             run_forward_paper_engine()
             report = generate_report()
             insert_daily_report(report)
+            prune_runtime_tables()
             log_event("research", "INFO", "research cycle completed", {"report_chars": len(report)})
             publish_event(
                 "market_intel.research",

@@ -8,7 +8,7 @@ import time
 from scripts.collector import collect
 from scripts.cache import publish_event
 from scripts.common import LAB_CONFIG, market_symbols, setup_logging
-from scripts.db import init_db, log_event, upsert_candles, upsert_futures_context
+from scripts.db import init_db, log_event, prune_runtime_tables, upsert_candles, upsert_futures_context
 
 LOGGER = logging.getLogger(__name__)
 RUNNING = True
@@ -39,6 +39,7 @@ def run_collector_service() -> None:
                     "market_intel.collector",
                     {"symbol": symbol, "candles": candle_rows, "context": context_rows},
                 )
+            prune_runtime_tables()
         except Exception as exc:
             LOGGER.exception("collector loop failed: %s", exc)
             log_event("collector", "ERROR", str(exc))

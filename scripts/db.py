@@ -17,6 +17,14 @@ def database_url() -> str:
     return os.getenv("DATABASE_URL", "postgresql://market:market@postgres:5432/market_intel")
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.getenv(name, str(default))))
+    except ValueError:
+        LOGGER.warning("Invalid integer for %s; using %s", name, default)
+        return default
+
+
 @contextmanager
 def get_conn() -> Iterator[psycopg.Connection]:
     conn = psycopg.connect(database_url(), row_factory=dict_row)
@@ -185,6 +193,132 @@ def log_event(service: str, level: str, message: str, raw: dict[str, Any] | None
             )
     except Exception as exc:
         LOGGER.warning("Could not write system log: %s", exc)
+
+
+def prune_runtime_tables() -> None:
+    """Keep runtime tables bounded so the VPS database does not grow forever."""
+    limits = {
+        "candles": _env_int("MARKET_INTEL_MAX_CANDLE_ROWS_PER_SYMBOL", 1200),
+        "context": _env_int("MARKET_INTEL_MAX_CONTEXT_ROWS_PER_SYMBOL", 1500),
+        "signals": _env_int("MARKET_INTEL_MAX_SIGNAL_ROWS", 750),
+        "paper_trades": _env_int("MARKET_INTEL_MAX_PAPER_TRADE_ROWS", 1000),
+        "daily_reports": _env_int("MARKET_INTEL_MAX_DAILY_REPORT_ROWS", 100),
+        "system_logs": _env_int("MARKET_INTEL_MAX_SYSTEM_LOG_ROWS", 500),
+    }
+    try:
+        with get_conn() as conn:
+            if limits["candles"]:
+                conn.execute(
+                    """
+                    DELETE FROM candles
+                    WHERE id IN (
+                        SELECT id FROM (
+                            SELECT id, row_number() OVER (
+                                PARTITION BY exchange, symbol, timeframe
+                                ORDER BY ts DESC, id DESC
+                            ) AS rn
+                            FROM candles
+                        ) ranked
+                        WHERE rn > %s
+                    )
+                    """,
+                    (limits["candles"],),
+                )
+            if limits["context"]:
+                for table in ("funding", "open_interest"):
+                    conn.execute(
+                        f"""
+                        DELETE FROM {table}
+                        WHERE id IN (
+                            SELECT id FROM (
+                                SELECT id, row_number() OVER (
+                                    PARTITION BY exchange, symbol
+                                    ORDER BY ts DESC, id DESC
+                                ) AS rn
+                                FROM {table}
+                            ) ranked
+                            WHERE rn > %s
+                        )
+                        """,
+                        (limits["context"],),
+                    )
+            if limits["signals"]:
+                conn.execute(
+                    """
+                    DELETE FROM signals
+                    WHERE id IN (
+                        SELECT id FROM (
+                            SELECT id, row_number() OVER (
+                                PARTITION BY symbol
+                                ORDER BY ts DESC, id DESC
+                            ) AS rn
+                            FROM signals
+                        ) ranked
+                        WHERE rn > %s
+                    )
+                    """,
+                    (limits["signals"],),
+                )
+            if limits["paper_trades"]:
+                conn.execute(
+                    """
+                    DELETE FROM paper_trades
+                    WHERE id IN (
+                        SELECT id FROM (
+                            SELECT id, row_number() OVER (ORDER BY ts DESC, id DESC) AS rn
+                            FROM paper_trades
+                        ) ranked
+                        WHERE rn > %s
+                    )
+                    """,
+                    (limits["paper_trades"],),
+                )
+                conn.execute(
+                    """
+                    DELETE FROM equity_curve
+                    WHERE id IN (
+                        SELECT id FROM (
+                            SELECT id, row_number() OVER (ORDER BY ts DESC, id DESC) AS rn
+                            FROM equity_curve
+                        ) ranked
+                        WHERE rn > %s
+                    )
+                    """,
+                    (limits["paper_trades"],),
+                )
+            if limits["daily_reports"]:
+                conn.execute(
+                    """
+                    DELETE FROM daily_reports
+                    WHERE id IN (
+                        SELECT id FROM (
+                            SELECT id, row_number() OVER (ORDER BY ts DESC, id DESC) AS rn
+                            FROM daily_reports
+                        ) ranked
+                        WHERE rn > %s
+                    )
+                    """,
+                    (limits["daily_reports"],),
+                )
+            if limits["system_logs"]:
+                conn.execute(
+                    """
+                    DELETE FROM system_logs
+                    WHERE id IN (
+                        SELECT id FROM (
+                            SELECT id, row_number() OVER (ORDER BY ts DESC, id DESC) AS rn
+                            FROM system_logs
+                        ) ranked
+                        WHERE rn > %s
+                    )
+                    """,
+                    (limits["system_logs"],),
+                )
+            conn.execute("DELETE FROM market_ticks WHERE created_at < now() - interval '7 days'")
+            conn.execute("DELETE FROM liquidations WHERE ts < now() - interval '7 days'")
+            conn.execute("DELETE FROM news WHERE ts < now() - interval '7 days'")
+    except Exception as exc:
+        LOGGER.warning("Could not prune runtime tables: %s", exc)
 
 
 def upsert_candles(df: pd.DataFrame, exchange: str = "binance", timeframe: str = "5m") -> int:

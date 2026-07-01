@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -54,6 +55,20 @@ def _dedupe_by_symbol_time(frame: pd.DataFrame, columns: list[str]) -> pd.DataFr
     clean = clean.drop_duplicates(["_symbol_key", "_timestamp_key"], keep="last")
     clean = clean.drop(columns=[column for column in clean.columns if column.startswith("_")])
     return clean.reindex(columns=columns).reset_index(drop=True)
+
+
+def _limit_rows(frame: pd.DataFrame, limit: int) -> pd.DataFrame:
+    if limit <= 0 or frame.empty or len(frame) <= limit:
+        return frame
+    return frame.tail(limit).reset_index(drop=True)
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return max(0, int(os.getenv(name, str(default))))
+    except ValueError:
+        LOGGER.warning("Invalid integer for %s; using %s", name, default)
+        return default
 
 
 def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -124,7 +139,12 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
             }
         )
 
-    signals = _dedupe_by_symbol_time(pd.concat([existing_signals, pd.DataFrame(new_signals)], ignore_index=True), SIGNAL_COLUMNS)
+    max_signal_rows = _env_int("MARKET_INTEL_MAX_FORWARD_SIGNAL_ROWS", 750)
+    max_result_rows = _env_int("MARKET_INTEL_MAX_FORWARD_RESULT_ROWS", 750)
+    signals = _limit_rows(
+        _dedupe_by_symbol_time(pd.concat([existing_signals, pd.DataFrame(new_signals)], ignore_index=True), SIGNAL_COLUMNS),
+        max_signal_rows,
+    )
     result_seen = {_row_key(row) for _, row in existing_results.iterrows()} if not existing_results.empty else set()
     balance = LAB_CONFIG.initial_balance if existing_results.empty else float(existing_results["balance"].iloc[-1])
     new_results: list[dict] = []
@@ -168,7 +188,10 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
                 "balance": balance,
             }
         )
-    results = _dedupe_by_symbol_time(pd.concat([existing_results, pd.DataFrame(new_results)], ignore_index=True), RESULT_COLUMNS)
+    results = _limit_rows(
+        _dedupe_by_symbol_time(pd.concat([existing_results, pd.DataFrame(new_results)], ignore_index=True), RESULT_COLUMNS),
+        max_result_rows,
+    )
     signals.to_csv(signal_path, index=False)
     results.to_csv(result_path, index=False)
     opened = None
