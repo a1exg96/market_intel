@@ -9,7 +9,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from scripts.common import CONFIG_DIR, KB_DIR, assert_dry_run_config, ensure_dirs, setup_logging
+from scripts.common import CONFIG_DIR, KB_DIR, assert_dry_run_config, ensure_dirs, market_symbols, setup_logging
 from scripts.privacy_audit import privacy_check
 
 LOGGER = logging.getLogger(__name__)
@@ -66,8 +66,9 @@ def run_full() -> None:
     from scripts.trade_rejection_report import build_trade_rejection_report
 
     privacy_check()
-    collect()
-    build_features()
+    for symbol in market_symbols():
+        collect(symbol=symbol)
+        build_features(symbol=symbol)
     run_target_audit()
     build_regime_labels()
     train()
@@ -165,11 +166,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "collect":
         from scripts.collector import collect
 
-        collect()
+        for symbol in market_symbols():
+            collect(symbol=symbol)
     elif args.command == "features":
         from scripts.feature_engineering import build_features
 
-        build_features()
+        for symbol in market_symbols():
+            build_features(symbol=symbol)
     elif args.command == "regime":
         from scripts.regime_engine import build_regime_labels
 

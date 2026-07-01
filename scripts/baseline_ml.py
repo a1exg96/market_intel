@@ -12,7 +12,7 @@ from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, brier_score_loss
 from sklearn.utils.class_weight import compute_sample_weight
 
-from scripts.common import LAB_CONFIG, MODELS_DIR, PROCESSED_DIR, REPORTS_DIR, ensure_dirs, read_parquet
+from scripts.common import LAB_CONFIG, MODELS_DIR, PROCESSED_DIR, REPORTS_DIR, ensure_dirs, market_symbols, read_parquet
 from scripts.feature_engineering import feature_columns
 
 LOGGER = logging.getLogger(__name__)
@@ -314,7 +314,7 @@ def save_feature_importance(model_result: SetupModelResult, filename: str) -> No
 
 
 def train(
-    symbol: str = LAB_CONFIG.raw_symbol,
+    symbol: str | None = None,
     interval: str = LAB_CONFIG.timeframe,
     horizon: str = "4h",
     target_threshold: float = 0.010,
@@ -323,7 +323,9 @@ def train(
     calibration_method: str = "sigmoid",
 ) -> pd.DataFrame:
     ensure_dirs()
-    df = read_parquet(PROCESSED_DIR / f"{symbol}_{interval}_features.parquet")
+    symbols = [symbol] if symbol else market_symbols()
+    frames = [read_parquet(PROCESSED_DIR / f"{item}_{interval}_features.parquet") for item in symbols]
+    df = pd.concat(frames, ignore_index=True).sort_values(["timestamp", "symbol"]).reset_index(drop=True)
     outcome_cols = [f"future_return_{horizon}", f"future_max_up_{horizon}", f"future_max_down_{horizon}"]
     train_df = df.dropna(subset=[col for col in outcome_cols if col in df.columns]).reset_index(drop=True)
     predictions, metrics, long_result, short_result, _ = walk_forward(

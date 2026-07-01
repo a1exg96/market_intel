@@ -10,7 +10,7 @@ import pandas as pd
 from scripts.baseline_ml import train
 from scripts.cache import publish_event
 from scripts.collector import collect
-from scripts.common import LAB_CONFIG, RAW_DIR, REPORTS_DIR, setup_logging
+from scripts.common import LAB_CONFIG, RAW_DIR, REPORTS_DIR, market_symbols, setup_logging
 from scripts.db import init_db, insert_daily_report, insert_signals, log_event
 from scripts.feature_engineering import build_features
 from scripts.forward_paper_engine import run_forward_paper_engine
@@ -35,12 +35,13 @@ def _safe_read(path: str) -> pd.DataFrame:
 
 
 def _ensure_seed_market_data() -> None:
-    candles_path = RAW_DIR / f"{LAB_CONFIG.raw_symbol}_{LAB_CONFIG.timeframe}_candles.parquet"
-    futures_path = RAW_DIR / f"{LAB_CONFIG.raw_symbol}_{LAB_CONFIG.timeframe}_futures_context.parquet"
-    if candles_path.exists() and futures_path.exists():
-        return
-    LOGGER.info("Seed market data missing; collecting %s before research cycle.", LAB_CONFIG.raw_symbol)
-    collect(symbol=LAB_CONFIG.raw_symbol, interval=LAB_CONFIG.timeframe, limit=1000)
+    for symbol in market_symbols():
+        candles_path = RAW_DIR / f"{symbol}_{LAB_CONFIG.timeframe}_candles.parquet"
+        futures_path = RAW_DIR / f"{symbol}_{LAB_CONFIG.timeframe}_futures_context.parquet"
+        if candles_path.exists() and futures_path.exists():
+            continue
+        LOGGER.info("Seed market data missing; collecting %s before research cycle.", symbol)
+        collect(symbol=symbol, interval=LAB_CONFIG.timeframe, limit=1000)
 
 
 def run_research_service() -> None:
@@ -52,7 +53,8 @@ def run_research_service() -> None:
         try:
             init_db()
             _ensure_seed_market_data()
-            build_features()
+            for symbol in market_symbols():
+                build_features(symbol=symbol)
             run_target_audit()
             build_regime_labels()
             predictions = train()

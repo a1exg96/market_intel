@@ -17,6 +17,7 @@ PROCESSED_DIR = DATA_DIR / "processed"
 REPORTS_DIR = DATA_DIR / "reports"
 KB_DIR = DATA_DIR / "knowledge_base"
 MODELS_DIR = ROOT / "models"
+DEFAULT_MARKET_SYMBOLS = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
 
 
 @dataclass(frozen=True)
@@ -34,6 +35,13 @@ class LabConfig:
 
 
 LAB_CONFIG = LabConfig()
+
+
+def market_symbols() -> list[str]:
+    raw = os.getenv("MARKET_INTEL_SYMBOLS")
+    if not raw:
+        return list(DEFAULT_MARKET_SYMBOLS)
+    return [item.strip().upper() for item in raw.split(",") if item.strip()]
 
 
 def ensure_dirs() -> None:

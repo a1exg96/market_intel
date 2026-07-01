@@ -14,7 +14,7 @@ from typing import Any
 import pandas as pd
 import yaml
 
-from scripts.common import CONFIG_DIR, LAB_CONFIG, PROCESSED_DIR, RAW_DIR, REPORTS_DIR, ensure_dirs, max_drawdown, profit_factor, read_parquet
+from scripts.common import CONFIG_DIR, LAB_CONFIG, PROCESSED_DIR, RAW_DIR, REPORTS_DIR, ensure_dirs, market_symbols, max_drawdown, profit_factor, read_parquet
 
 ACTIVE_POSITION_COLUMNS = [
     "position_id",
@@ -401,24 +401,28 @@ def _unrealized_return(side: str, entry_price: float, current_price: float) -> f
 
 def latest_local_prices() -> dict[str, float]:
     prices: dict[str, float] = {}
-    raw_path = RAW_DIR / f"{LAB_CONFIG.raw_symbol}_{LAB_CONFIG.timeframe}_candles.parquet"
-    if raw_path.exists():
+    for symbol in market_symbols():
+        raw_path = RAW_DIR / f"{symbol}_{LAB_CONFIG.timeframe}_candles.parquet"
+        if not raw_path.exists():
+            continue
         try:
             candles = read_parquet(raw_path)
             if not candles.empty:
-                symbol = str(candles["symbol"].iloc[-1]) if "symbol" in candles.columns else LAB_CONFIG.raw_symbol
-                prices[symbol] = float(candles["close"].iloc[-1])
-                return prices
+                candle_symbol = str(candles["symbol"].iloc[-1]) if "symbol" in candles.columns else symbol
+                prices[candle_symbol] = float(candles["close"].iloc[-1])
         except Exception:
             pass
-    try:
-        features = read_parquet(PROCESSED_DIR / f"{LAB_CONFIG.raw_symbol}_{LAB_CONFIG.timeframe}_features.parquet")
-    except FileNotFoundError:
+    if prices:
         return prices
-    if features.empty:
-        return prices
-    symbol = str(features["symbol"].iloc[-1]) if "symbol" in features.columns else LAB_CONFIG.raw_symbol
-    prices[symbol] = float(features["close"].iloc[-1])
+    for symbol in market_symbols():
+        try:
+            features = read_parquet(PROCESSED_DIR / f"{symbol}_{LAB_CONFIG.timeframe}_features.parquet")
+        except FileNotFoundError:
+            continue
+        if features.empty:
+            continue
+        feature_symbol = str(features["symbol"].iloc[-1]) if "symbol" in features.columns else symbol
+        prices[feature_symbol] = float(features["close"].iloc[-1])
     return prices
 
 

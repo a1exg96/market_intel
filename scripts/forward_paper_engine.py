@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from scripts.common import LAB_CONFIG, PROCESSED_DIR, REPORTS_DIR, ensure_dirs, read_parquet
+from scripts.common import LAB_CONFIG, PROCESSED_DIR, REPORTS_DIR, ensure_dirs, market_symbols, read_parquet
 from scripts.execution_engine import HORIZON_ROWS
 from scripts.paper_execution import execute_latest_unaudited_signal, latest_local_prices, open_position_from_signal, update_open_positions
 
@@ -63,11 +63,14 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
     outcome fields first, then settles only signals whose horizon has elapsed.
     """
     ensure_dirs()
-    features = read_parquet(PROCESSED_DIR / f"{LAB_CONFIG.raw_symbol}_{LAB_CONFIG.timeframe}_features.parquet")
+    features = pd.concat(
+        [read_parquet(PROCESSED_DIR / f"{symbol}_{LAB_CONFIG.timeframe}_features.parquet") for symbol in market_symbols()],
+        ignore_index=True,
+    )
     predictions = read_parquet(PROCESSED_DIR / "predictions.parquet")
     features["timestamp"] = pd.to_datetime(features["timestamp"], utc=True)
     predictions["timestamp"] = pd.to_datetime(predictions["timestamp"], utc=True)
-    features = features.sort_values("timestamp").reset_index(drop=True)
+    features = features.sort_values(["symbol", "timestamp"]).reset_index(drop=True)
     predictions = predictions.sort_values("timestamp").reset_index(drop=True)
     regime_path = PROCESSED_DIR / "regime_labels.parquet"
     regimes = read_parquet(regime_path) if regime_path.exists() else pd.DataFrame(columns=["timestamp", "symbol", "regime"])
@@ -80,13 +83,14 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
     existing_results = _dedupe_by_symbol_time(_read_csv(result_path, RESULT_COLUMNS), RESULT_COLUMNS)
     seen = {_row_key(row) for _, row in existing_signals.iterrows()} if not existing_signals.empty else set()
 
-    feature_index = {ts: i for i, ts in enumerate(features["timestamp"])}
+    feature_index = {(str(row["symbol"]), row["timestamp"]): i for i, row in features.iterrows()}
     new_signals: list[dict] = []
     for _, row in predictions.iterrows():
         ts = row["timestamp"]
         if (str(row.get("symbol", "")), _timestamp_key(ts)) in seen:
             continue
-        idx = feature_index.get(ts)
+        symbol = str(row.get("symbol", ""))
+        idx = feature_index.get((symbol, ts))
         if idx is None:
             continue
         direction = str(row["predicted_direction"])
@@ -94,13 +98,16 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
         market_price = latest_local_prices().get(str(row["symbol"]))
         if signal_name == "NO_TRADE":
             entry_price = float(features.loc[idx, "close"])
-        elif idx + 1 < len(features):
-            entry_price = float(features.loc[idx + 1, "open"])
         else:
-            entry_price = float(market_price if market_price is not None else features.loc[idx, "close"])
+            symbol_features = features[features["symbol"].astype(str) == symbol].reset_index(drop=True)
+            symbol_idx = symbol_features.index[symbol_features["timestamp"] == ts]
+            if len(symbol_idx) and int(symbol_idx[0]) + 1 < len(symbol_features):
+                entry_price = float(symbol_features.loc[int(symbol_idx[0]) + 1, "open"])
+            else:
+                entry_price = float(market_price if market_price is not None else features.loc[idx, "close"])
         regime = "UNKNOWN"
         if not regimes.empty:
-            prior = regimes[regimes["timestamp"] <= ts].tail(1)
+            prior = regimes[(regimes["symbol"].astype(str) == symbol) & (regimes["timestamp"] <= ts)].tail(1)
             if not prior.empty:
                 regime = str(prior["regime"].iloc[0])
         new_signals.append(
@@ -127,15 +134,20 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
         if _row_key(signal) in result_seen:
             continue
         ts = pd.Timestamp(signal["timestamp"])
-        idx = feature_index.get(ts)
+        symbol = str(signal.get("symbol", ""))
+        idx = feature_index.get((symbol, ts))
         if idx is None:
             continue
+        symbol_features = features[features["symbol"].astype(str) == symbol].reset_index(drop=True)
+        symbol_idx = symbol_features.index[symbol_features["timestamp"] == ts]
+        if not len(symbol_idx):
+            continue
         horizon_rows = HORIZON_ROWS.get(str(signal.get("horizon", "4h")), 48)
-        exit_idx = idx + 1 + horizon_rows
-        if exit_idx >= len(features):
+        exit_idx = int(symbol_idx[0]) + 1 + horizon_rows
+        if exit_idx >= len(symbol_features):
             continue
         entry = float(signal["entry_price"])
-        exit_price = float(features.loc[exit_idx, "close"])
+        exit_price = float(symbol_features.loc[exit_idx, "close"])
         gross = exit_price / entry - 1
         signed = gross if signal["signal"] == "LONG" else -gross
         trade_return = signed - LAB_CONFIG.fee_pct * 2 - LAB_CONFIG.slippage_pct

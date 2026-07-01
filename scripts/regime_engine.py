@@ -5,7 +5,7 @@ import logging
 import numpy as np
 import pandas as pd
 
-from scripts.common import LAB_CONFIG, PROCESSED_DIR, ensure_dirs, read_parquet, save_parquet
+from scripts.common import LAB_CONFIG, PROCESSED_DIR, ensure_dirs, market_symbols, read_parquet, save_parquet
 
 LOGGER = logging.getLogger(__name__)
 
@@ -62,9 +62,13 @@ def classify_regimes(df: pd.DataFrame) -> pd.DataFrame:
     return work[["timestamp", "symbol", "regime", "regime_confidence"]]
 
 
-def build_regime_labels(symbol: str = LAB_CONFIG.raw_symbol, interval: str = LAB_CONFIG.timeframe) -> pd.DataFrame:
+def build_regime_labels(symbol: str | None = None, interval: str = LAB_CONFIG.timeframe) -> pd.DataFrame:
     ensure_dirs()
-    features = read_parquet(PROCESSED_DIR / f"{symbol}_{interval}_features.parquet")
+    symbols = [symbol] if symbol else market_symbols()
+    features = pd.concat(
+        [read_parquet(PROCESSED_DIR / f"{item}_{interval}_features.parquet") for item in symbols],
+        ignore_index=True,
+    ).sort_values(["timestamp", "symbol"])
     regimes = classify_regimes(features)
     save_parquet(regimes, PROCESSED_DIR / "regime_labels.parquet")
     LOGGER.info("Saved regime labels rows=%s distribution=%s", len(regimes), regimes["regime"].value_counts().to_dict())
@@ -76,4 +80,3 @@ if __name__ == "__main__":
 
     setup_logging()
     build_regime_labels()
-

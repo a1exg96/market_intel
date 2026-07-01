@@ -4,7 +4,7 @@ import logging
 
 import pandas as pd
 
-from scripts.common import LAB_CONFIG, PROCESSED_DIR, REPORTS_DIR, ensure_dirs, read_parquet
+from scripts.common import LAB_CONFIG, PROCESSED_DIR, REPORTS_DIR, ensure_dirs, market_symbols, read_parquet
 
 LOGGER = logging.getLogger(__name__)
 MOVE_THRESHOLDS = [0.005, 0.010, 0.015, 0.020, 0.030]
@@ -16,17 +16,18 @@ def _suffix(threshold: float) -> str:
     return f"{int(threshold * 1000):03d}"
 
 
-def run_target_audit(symbol: str = LAB_CONFIG.raw_symbol, interval: str = LAB_CONFIG.timeframe) -> pd.DataFrame:
+def run_target_audit(symbol: str | None = None, interval: str = LAB_CONFIG.timeframe) -> pd.DataFrame:
     ensure_dirs()
-    features_path = PROCESSED_DIR / f"{symbol}_{interval}_features.parquet"
-    if not features_path.exists():
+    symbols = [symbol] if symbol else market_symbols()
+    feature_paths = [PROCESSED_DIR / f"{item}_{interval}_features.parquet" for item in symbols]
+    if any(not path.exists() for path in feature_paths):
         report = "# Target Audit\n\nInsufficient data: features file not found. Run `features` first.\n"
         (REPORTS_DIR / "target_audit.md").write_text(report, encoding="utf-8")
         empty = pd.DataFrame()
         empty.to_csv(REPORTS_DIR / "target_distribution.csv", index=False)
         return empty
 
-    df = read_parquet(features_path)
+    df = pd.concat([read_parquet(path) for path in feature_paths], ignore_index=True)
     rows: list[dict[str, float | int | str | bool]] = []
     for horizon in HORIZONS:
         up_col = f"future_max_up_{horizon}"
@@ -105,4 +106,3 @@ if __name__ == "__main__":
 
     setup_logging()
     run_target_audit()
-

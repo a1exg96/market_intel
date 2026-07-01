@@ -7,7 +7,7 @@ import time
 
 from scripts.collector import collect
 from scripts.cache import publish_event
-from scripts.common import LAB_CONFIG, setup_logging
+from scripts.common import LAB_CONFIG, market_symbols, setup_logging
 from scripts.db import init_db, log_event, upsert_candles, upsert_futures_context
 
 LOGGER = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ def run_collector_service() -> None:
     signal.signal(signal.SIGTERM, _stop)
     signal.signal(signal.SIGINT, _stop)
     interval = int(os.getenv("COLLECTOR_INTERVAL_SECONDS", "30"))
-    symbols = [item.strip() for item in os.getenv("MARKET_INTEL_SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if item.strip()]
+    symbols = market_symbols()
     while RUNNING:
         try:
             init_db()
