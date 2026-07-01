@@ -415,6 +415,7 @@ def index() -> str:
     .closeBtn { width:24px; height:24px; border:1px solid #6d1d2a; border-radius:6px; background:#35131a; color:var(--red); font-weight:700; cursor:pointer; line-height:1; }
     .closeBtn:disabled, .actionBtn:disabled { opacity:.55; cursor:wait; }
     .settingsStatus { color:var(--muted); font-size:10px; min-height:13px; }
+    .apiStatus { color:var(--red); font-size:12px; min-height:16px; padding:0 12px 8px; }
     .scroll { max-height:210px; overflow-y:auto; }
     .scrollSmall { max-height:92px; overflow-y:auto; }
     .profit { color:var(--green); }
@@ -439,6 +440,7 @@ def index() -> str:
     <strong>Лабораторія паперової торгівлі</strong>
     <span><span id="updated">завантаження...</span> <a href="/logout">Вийти</a></span>
   </header>
+  <div id="apiStatus" class="apiStatus"></div>
   <main>
     <section class="grid">
       <div class="card"><div class="label">Баланс</div><div class="value" id="balance">-</div></div>
@@ -485,16 +487,30 @@ def index() -> str:
     </section>
   </main>
 <script>
+async function fetchJson(path) {
+  const response = await fetch(path);
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    if (response.status === 401) {
+      window.location.href = '/login';
+      throw new Error('login required');
+    }
+    throw new Error(payload.detail || `${path} failed with HTTP ${response.status}`);
+  }
+  return payload;
+}
 async function refresh() {
+  try {
   const [stats, positions, trades, signals, audit, prices, settings] = await Promise.all([
-    fetch('/api/stats').then(r => r.json()),
-    fetch('/api/active-positions').then(r => r.json()),
-    fetch('/api/trades').then(r => r.json()),
-    fetch('/api/signals').then(r => r.json()),
-    fetch('/api/signal-execution-audit').then(r => r.json()),
-    fetch('/api/market-prices').then(r => r.json()),
-    fetch('/api/settings').then(r => r.json())
+    fetchJson('/api/stats'),
+    fetchJson('/api/active-positions'),
+    fetchJson('/api/trades'),
+    fetchJson('/api/signals'),
+    fetchJson('/api/signal-execution-audit'),
+    fetchJson('/api/market-prices'),
+    fetchJson('/api/settings')
   ]);
+  setText('apiStatus', '');
   setText('balance', money(stats.balance));
   setText('equityValue', money(stats.equity));
   setText('realized', money(stats.realized_pnl));
@@ -504,13 +520,20 @@ async function refresh() {
   setText('winrate', pct(stats.winrate));
   setText('pf', Number.isFinite(stats.profit_factor) ? fmt(stats.profit_factor, 2) : 'inf');
   setText('maxdd', pct(stats.max_drawdown));
-  renderSignal(signals[0] || null, audit[0] || null);
+  const safeSignals = Array.isArray(signals) ? signals : [];
+  const safeAudit = Array.isArray(audit) ? audit : [];
+  renderSignal(safeSignals[0] || null, safeAudit[0] || null);
   renderSettings(settings || stats.settings || {});
-  renderPositions(positions || []);
-  renderPrices(prices || []);
-  renderTrades(trades || []);
-  renderSignals(signals || []);
+  renderPositions(Array.isArray(positions) ? positions : []);
+  renderPrices(Array.isArray(prices) ? prices : []);
+  renderTrades(Array.isArray(trades) ? trades : []);
+  renderSignals(safeSignals);
   setText('updated', displayTime(stats.last_update || ''));
+  } catch (error) {
+    if (String(error.message || '') === 'login required') return;
+    setText('apiStatus', `API error: ${error.message || error}`);
+    setText('updated', 'API error');
+  }
 }
 function setText(id, value) { document.getElementById(id).textContent = value; }
 function fmt(v, d = 4) { return Number(v || 0).toFixed(d); }
