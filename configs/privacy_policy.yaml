@@ -1,0 +1,22 @@
+privacy_mode: true
+audit_log: data/reports/outbound_audit.log
+default_action: block
+allowed_domains:
+  - binance.com
+  - api.binance.com
+  - fapi.binance.com
+  - bybit.com
+  - okx.com
+  - coinbase.com
+  - kraken.com
+disabled_by_default:
+  - telegram
+  - discord
+  - sentry
+  - analytics
+  - cloud_telemetry
+  - remote_logging
+optional_integrations:
+  news_api_enabled: false
+  onchain_api_enabled: false
+

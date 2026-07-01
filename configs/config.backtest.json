@@ -1,0 +1,20 @@
+{
+  "trading_mode": "futures",
+  "dry_run": true,
+  "dry_run_wallet": 1000,
+  "stake_currency": "USDT",
+  "exchange": {
+    "name": "binance",
+    "key": "",
+    "secret": "",
+    "ccxt_config": {
+      "enableRateLimit": true
+    },
+    "pair_whitelist": ["BTC/USDT"],
+    "pair_blacklist": []
+  },
+  "timeframe": "5m",
+  "strategy": "MarketIntelStrategy",
+  "timerange": "20240101-"
+}
+
