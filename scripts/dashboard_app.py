@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import time
+import os
+import secrets
 from datetime import datetime, timezone
 from typing import Any
 from zoneinfo import ZoneInfo
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import HTMLResponse
 
 from scripts.cache import redis_status
@@ -25,6 +28,44 @@ STARTED_AT = time.time()
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
 TIME_FIELDS = {"timestamp", "ts", "opened_at", "closed_at", "last_update", "updated_at", "generated_at"}
 app = FastAPI(title="Market Intelligence Dashboard", version="0.1")
+security = HTTPBasic()
+
+
+def _dashboard_user() -> str:
+    return os.getenv("DASHBOARD_USERNAME", "admin")
+
+
+def _dashboard_password() -> str:
+    return os.getenv("DASHBOARD_PASSWORD", "")
+
+
+def _allowed_dashboard_ips() -> set[str]:
+    raw = os.getenv("DASHBOARD_ALLOWED_IPS", "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def require_dashboard_access(request: Request, credentials: HTTPBasicCredentials = Depends(security)) -> str:
+    password = _dashboard_password()
+    if not password:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Dashboard access is not configured. Set DASHBOARD_PASSWORD in .env.",
+        )
+
+    allowed_ips = _allowed_dashboard_ips()
+    client_ip = request.client.host if request.client else ""
+    if allowed_ips and client_ip not in allowed_ips:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="IP address is not allowed.")
+
+    username_ok = secrets.compare_digest(credentials.username, _dashboard_user())
+    password_ok = secrets.compare_digest(credentials.password, password)
+    if not (username_ok and password_ok):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid dashboard credentials.",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
 
 
 def _to_kyiv_time(value: Any) -> Any:
@@ -99,38 +140,38 @@ def health() -> dict[str, Any]:
     }
 
 
-@app.get("/api/stats")
+@app.get("/api/stats", dependencies=[Depends(require_dashboard_access)])
 def api_stats() -> dict[str, Any]:
     return _with_kyiv_times(stats_snapshot())
 
 
-@app.get("/api/active-positions")
+@app.get("/api/active-positions", dependencies=[Depends(require_dashboard_access)])
 def api_active_positions() -> list[dict[str, Any]]:
     stats_snapshot()
     return _records_kyiv(records(read_active_positions(open_only=True)))
 
 
-@app.get("/api/trades")
+@app.get("/api/trades", dependencies=[Depends(require_dashboard_access)])
 def api_trades() -> list[dict[str, Any]]:
     return _records_kyiv(records(read_trades().tail(100).iloc[::-1].reset_index(drop=True)))
 
 
-@app.get("/api/signals")
+@app.get("/api/signals", dependencies=[Depends(require_dashboard_access)])
 def api_signals() -> list[dict[str, Any]]:
     return _records_kyiv(records(read_signals(limit=100).iloc[::-1].reset_index(drop=True)))
 
 
-@app.get("/api/signal-execution-audit")
+@app.get("/api/signal-execution-audit", dependencies=[Depends(require_dashboard_access)])
 def api_signal_execution_audit() -> list[dict[str, Any]]:
     return _records_kyiv(records(read_audit().tail(100).iloc[::-1].reset_index(drop=True)))
 
 
-@app.get("/api/market-prices")
+@app.get("/api/market-prices", dependencies=[Depends(require_dashboard_access)])
 def api_market_prices() -> list[dict[str, Any]]:
     return _market_price_rows()
 
 
-@app.get("/api/summary")
+@app.get("/api/summary", dependencies=[Depends(require_dashboard_access)])
 def summary() -> dict[str, Any]:
     signals = api_signals()
     audit = api_signal_execution_audit()
@@ -151,7 +192,7 @@ def summary() -> dict[str, Any]:
     }
 
 
-@app.get("/", response_class=HTMLResponse)
+@app.get("/", response_class=HTMLResponse, dependencies=[Depends(require_dashboard_access)])
 def index() -> str:
     return """
 <!doctype html>

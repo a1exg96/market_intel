@@ -57,6 +57,27 @@ cp .env.example .env
 
 Check `.env` before starting. The default paper-lab settings are safe: no live trading, local paper execution, collector interval 5 seconds.
 
+Set a private dashboard password:
+
+```bash
+nano .env
+```
+
+Use a strong value:
+
+```text
+DASHBOARD_USERNAME=admin
+DASHBOARD_PASSWORD=PUT_A_LONG_PRIVATE_PASSWORD_HERE
+```
+
+Optional: restrict the dashboard to specific public IP addresses:
+
+```text
+DASHBOARD_ALLOWED_IPS=203.0.113.10,198.51.100.25
+```
+
+Leave `DASHBOARD_ALLOWED_IPS` empty if your home or mobile IP addresses change often. The password protection still applies to the dashboard and all `/api/*` endpoints.
+
 ## 5. Start services
 
 ```bash
