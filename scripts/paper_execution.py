@@ -148,7 +148,24 @@ def read_audit() -> pd.DataFrame:
 def read_signals(limit: int = 100) -> pd.DataFrame:
     if not SIGNALS_PATH.exists() or SIGNALS_PATH.stat().st_size == 0:
         return pd.DataFrame()
-    return pd.read_csv(SIGNALS_PATH).tail(limit).reset_index(drop=True)
+    frame = pd.read_csv(SIGNALS_PATH)
+    if frame.empty:
+        return frame
+    if {"timestamp", "symbol"}.issubset(frame.columns):
+        normalized_timestamp = pd.to_datetime(frame["timestamp"], utc=True, errors="coerce", format="mixed")
+        frame = frame.assign(
+            _timestamp_key=normalized_timestamp.dt.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            _symbol_key=frame["symbol"].astype(str),
+            _timestamp_sort=normalized_timestamp,
+        )
+        sort_columns = ["_timestamp_sort"]
+        if "generated_at" in frame.columns:
+            frame["_generated_sort"] = pd.to_datetime(frame["generated_at"], utc=True, errors="coerce", format="mixed")
+            sort_columns.append("_generated_sort")
+        frame = frame.sort_values(sort_columns, na_position="last")
+        frame = frame.drop_duplicates(["_timestamp_key", "_symbol_key"], keep="last")
+        frame = frame.drop(columns=[column for column in frame.columns if column.startswith("_")])
+    return frame.tail(limit).reset_index(drop=True)
 
 
 def _append_csv(path: Path, columns: list[str], rows: list[dict[str, Any]]) -> None:

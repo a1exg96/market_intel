@@ -39,6 +39,58 @@ class PaperExecutionTest(unittest.TestCase):
             finally:
                 pe.RAW_DIR, pe.PROCESSED_DIR = original_dirs
 
+    def test_read_signals_deduplicates_timestamp_symbol_and_sorts_latest(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reports = Path(tmp)
+            original_path = pe.SIGNALS_PATH
+            pe.SIGNALS_PATH = reports / "forward_signals.csv"
+            try:
+                pd.DataFrame(
+                    [
+                        {
+                            "timestamp": "2026-07-01T10:00:00+00:00",
+                            "generated_at": "2026-07-01T10:01:00+00:00",
+                            "symbol": "BTCUSDT",
+                            "regime": "RANGE",
+                            "signal": "NO_TRADE",
+                            "confidence": 0.30,
+                            "entry_price": 60000,
+                            "horizon": "4h",
+                            "status": "PENDING",
+                        },
+                        {
+                            "timestamp": "2026-07-01 10:00:00+00:00",
+                            "generated_at": "2026-07-01T10:02:00+00:00",
+                            "symbol": "BTCUSDT",
+                            "regime": "RANGE",
+                            "signal": "SHORT",
+                            "confidence": 0.67,
+                            "entry_price": 59900,
+                            "horizon": "4h",
+                            "status": "PENDING",
+                        },
+                        {
+                            "timestamp": "2026-07-01T10:05:00+00:00",
+                            "generated_at": "2026-07-01T10:06:00+00:00",
+                            "symbol": "ETHUSDT",
+                            "regime": "RANGE",
+                            "signal": "LONG",
+                            "confidence": 0.61,
+                            "entry_price": 2500,
+                            "horizon": "4h",
+                            "status": "PENDING",
+                        },
+                    ]
+                ).to_csv(pe.SIGNALS_PATH, index=False)
+
+                signals = pe.read_signals(limit=10)
+
+                self.assertEqual(len(signals), 2)
+                self.assertEqual(signals.iloc[0]["signal"], "SHORT")
+                self.assertEqual(signals.iloc[1]["symbol"], "ETHUSDT")
+            finally:
+                pe.SIGNALS_PATH = original_path
+
     def test_short_signal_opens_position_without_closing_trade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             reports = Path(tmp)

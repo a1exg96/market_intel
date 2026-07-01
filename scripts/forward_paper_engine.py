@@ -18,7 +18,42 @@ RESULT_COLUMNS = ["timestamp", "symbol", "regime", "signal", "confidence", "entr
 def _read_csv(path: Path, columns: list[str]) -> pd.DataFrame:
     if not path.exists() or path.stat().st_size == 0:
         return pd.DataFrame(columns=columns)
-    return pd.read_csv(path)
+    frame = pd.read_csv(path)
+    for column in columns:
+        if column not in frame.columns:
+            frame[column] = None
+    return frame[columns]
+
+
+def _timestamp_key(value: object) -> str:
+    ts = pd.Timestamp(value)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    else:
+        ts = ts.tz_convert("UTC")
+    return ts.isoformat()
+
+
+def _row_key(row: pd.Series | dict) -> tuple[str, str]:
+    return str(row.get("symbol", "")), _timestamp_key(row.get("timestamp"))
+
+
+def _dedupe_by_symbol_time(frame: pd.DataFrame, columns: list[str]) -> pd.DataFrame:
+    if frame.empty or not {"timestamp", "symbol"}.issubset(frame.columns):
+        return frame.reindex(columns=columns)
+    clean = frame.copy()
+    parsed_timestamp = pd.to_datetime(clean["timestamp"], utc=True, errors="coerce", format="mixed")
+    clean["_timestamp_key"] = parsed_timestamp.dt.strftime("%Y-%m-%dT%H:%M:%S%z")
+    clean["_timestamp_sort"] = parsed_timestamp
+    clean["_symbol_key"] = clean["symbol"].astype(str)
+    sort_columns = ["_timestamp_sort"]
+    if "generated_at" in clean.columns:
+        clean["_generated_sort"] = pd.to_datetime(clean["generated_at"], utc=True, errors="coerce", format="mixed")
+        sort_columns.append("_generated_sort")
+    clean = clean.sort_values(sort_columns, na_position="last")
+    clean = clean.drop_duplicates(["_symbol_key", "_timestamp_key"], keep="last")
+    clean = clean.drop(columns=[column for column in clean.columns if column.startswith("_")])
+    return clean.reindex(columns=columns).reset_index(drop=True)
 
 
 def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -41,15 +76,15 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
 
     signal_path = REPORTS_DIR / "forward_signals.csv"
     result_path = REPORTS_DIR / "forward_results.csv"
-    existing_signals = _read_csv(signal_path, SIGNAL_COLUMNS)
-    existing_results = _read_csv(result_path, RESULT_COLUMNS)
-    seen = set(existing_signals["timestamp"].astype(str)) if not existing_signals.empty else set()
+    existing_signals = _dedupe_by_symbol_time(_read_csv(signal_path, SIGNAL_COLUMNS), SIGNAL_COLUMNS)
+    existing_results = _dedupe_by_symbol_time(_read_csv(result_path, RESULT_COLUMNS), RESULT_COLUMNS)
+    seen = {_row_key(row) for _, row in existing_signals.iterrows()} if not existing_signals.empty else set()
 
     feature_index = {ts: i for i, ts in enumerate(features["timestamp"])}
     new_signals: list[dict] = []
     for _, row in predictions.iterrows():
         ts = row["timestamp"]
-        if str(ts) in seen:
+        if (str(row.get("symbol", "")), _timestamp_key(ts)) in seen:
             continue
         idx = feature_index.get(ts)
         if idx is None:
@@ -82,14 +117,14 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
             }
         )
 
-    signals = pd.concat([existing_signals, pd.DataFrame(new_signals)], ignore_index=True)
-    result_seen = set(existing_results["timestamp"].astype(str)) if not existing_results.empty else set()
+    signals = _dedupe_by_symbol_time(pd.concat([existing_signals, pd.DataFrame(new_signals)], ignore_index=True), SIGNAL_COLUMNS)
+    result_seen = {_row_key(row) for _, row in existing_results.iterrows()} if not existing_results.empty else set()
     balance = LAB_CONFIG.initial_balance if existing_results.empty else float(existing_results["balance"].iloc[-1])
     new_results: list[dict] = []
     for _, signal in signals.iterrows():
         if str(signal.get("signal", "")).upper() == "NO_TRADE":
             continue
-        if str(signal["timestamp"]) in result_seen:
+        if _row_key(signal) in result_seen:
             continue
         ts = pd.Timestamp(signal["timestamp"])
         idx = feature_index.get(ts)
@@ -121,7 +156,7 @@ def run_forward_paper_engine() -> tuple[pd.DataFrame, pd.DataFrame]:
                 "balance": balance,
             }
         )
-    results = pd.concat([existing_results, pd.DataFrame(new_results)], ignore_index=True)
+    results = _dedupe_by_symbol_time(pd.concat([existing_results, pd.DataFrame(new_results)], ignore_index=True), RESULT_COLUMNS)
     signals.to_csv(signal_path, index=False)
     results.to_csv(result_path, index=False)
     opened = None
