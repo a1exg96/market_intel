@@ -14,6 +14,7 @@ from sklearn.utils.class_weight import compute_sample_weight
 
 from scripts.common import LAB_CONFIG, MODELS_DIR, PROCESSED_DIR, REPORTS_DIR, ensure_dirs, market_symbols, read_parquet
 from scripts.feature_engineering import feature_columns
+from scripts.model_quality import apply_model_quality_gate, expected_calibration_error
 from scripts.scoring_engine import score_to_dict, build_trade_score
 
 LOGGER = logging.getLogger(__name__)
@@ -21,8 +22,6 @@ TARGET_THRESHOLDS = [0.005, 0.010, 0.015, 0.020]
 CONFIDENCE_THRESHOLDS = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85]
 BALANCE_METHODS = ["none", "class_weight", "undersample", "oversample", "balanced_sample_weight"]
 CALIBRATION_METHODS = ["none", "sigmoid", "isotonic"]
-MIN_EDGE_SAMPLES = 30
-MIN_EDGE_PRECISION = 0.52
 
 
 def threshold_suffix(threshold: float) -> str:
@@ -314,15 +313,7 @@ def walk_forward(
 
 
 def _ece(probabilities: pd.Series, actual: pd.Series, bins: int = 10) -> float:
-    data = pd.DataFrame({"prob": probabilities, "actual": actual}).dropna()
-    if data.empty:
-        return 0.0
-    data["bucket"] = pd.cut(data["prob"], np.linspace(0, 1, bins + 1), include_lowest=True)
-    error = 0.0
-    for _, part in data.groupby("bucket", observed=False):
-        if not part.empty:
-            error += len(part) / len(data) * abs(part["prob"].mean() - part["actual"].mean())
-    return float(error)
+    return expected_calibration_error(probabilities, actual, bins=bins)
 
 
 def save_calibration_report(predictions: pd.DataFrame) -> None:
@@ -355,35 +346,7 @@ Calibration methods supported: `sigmoid` via `CalibratedClassifierCV` and `isoto
 def _apply_empirical_edge_gate(predictions: pd.DataFrame) -> tuple[pd.DataFrame, dict[str, float | str]]:
     if predictions.empty or "side" not in predictions:
         return predictions, {}
-    out = predictions.copy()
-    validation = out[out.get("actual_label", pd.Series(dtype=str)).astype(str) != "UNKNOWN_LIVE"].copy()
-    policy: dict[str, float | str] = {}
-    blocked_sides: set[str] = set()
-    for side, actual_col in {"LONG": "actual_long", "SHORT": "actual_short"}.items():
-        selected = validation[validation["side"].astype(str) == side].copy()
-        signed_return = pd.Series(dtype="float64")
-        if not selected.empty and "future_return" in selected:
-            raw_return = pd.to_numeric(selected["future_return"], errors="coerce")
-            signed_return = raw_return if side == "LONG" else -raw_return
-            signed_return = signed_return - LAB_CONFIG.fee_pct * 2 - LAB_CONFIG.slippage_pct
-        samples = int(len(selected))
-        precision = float(pd.to_numeric(selected.get(actual_col, pd.Series(dtype=float)), errors="coerce").fillna(0).eq(1).mean()) if samples else 0.0
-        expectancy = float(signed_return.dropna().mean()) if not signed_return.dropna().empty else 0.0
-        policy[f"{side.lower()}_samples"] = samples
-        policy[f"{side.lower()}_precision"] = precision
-        policy[f"{side.lower()}_expectancy"] = expectancy
-        if samples < MIN_EDGE_SAMPLES or precision < MIN_EDGE_PRECISION or expectancy <= 0:
-            blocked_sides.add(side)
-            policy[f"{side.lower()}_edge"] = "blocked"
-        else:
-            policy[f"{side.lower()}_edge"] = "allowed"
-    if blocked_sides:
-        mask = out["side"].astype(str).isin(blocked_sides)
-        out.loc[mask, "reason"] = out.loc[mask, "reason"].astype(str) + "; INSUFFICIENT_EMPIRICAL_EDGE"
-        out.loc[mask, "side"] = "NO_TRADE"
-        out.loc[mask, "predicted_direction"] = "flat"
-        out.loc[mask, "position_size"] = 0.0
-    return out, policy
+    return apply_model_quality_gate(predictions)
 
 
 def save_feature_importance(model_result: SetupModelResult, filename: str) -> None:

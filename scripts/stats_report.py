@@ -114,6 +114,37 @@ def _target_and_calibration_section() -> str:
 """
 
 
+def _model_quality_section() -> str:
+    quality_path = REPORTS_DIR / "model_quality.csv"
+    regime_path = REPORTS_DIR / "regime_quality.csv"
+    if not quality_path.exists():
+        return "## Model Quality Gate\n\nNo model quality gate report is available yet.\n"
+    quality = pd.read_csv(quality_path)
+    if quality.empty:
+        return "## Model Quality Gate\n\nNo model quality rows were generated.\n"
+    lines = [
+        (
+            f"- {row['side']}: status={row['status']}, samples={int(row['samples'])}, "
+            f"precision={float(row['precision']):.2%}, expectancy={float(row['expectancy']):.4f}, "
+            f"ece={float(row['ece']):.4f}, reasons={row.get('reasons', '') or 'none'}"
+        )
+        for _, row in quality.iterrows()
+    ]
+    blocked_regimes = ""
+    if regime_path.exists():
+        try:
+            regimes = pd.read_csv(regime_path)
+        except EmptyDataError:
+            regimes = pd.DataFrame()
+        if not regimes.empty and "status" in regimes:
+            blocked = regimes[regimes["status"].astype(str) == "blocked"].head(5)
+            if not blocked.empty:
+                blocked_regimes = "\nBlocked regimes: " + "; ".join(
+                    f"{row['side']} {row['regime']} ({row['reasons']})" for _, row in blocked.iterrows()
+                )
+    return "## Model Quality Gate\n\n" + "\n".join(lines) + blocked_regimes + "\n"
+
+
 def _probability_summary_section() -> str:
     path = REPORTS_DIR / "probability_buckets.csv"
     if not path.exists():
@@ -232,6 +263,7 @@ def generate_report() -> str:
     signal_section, diagnosis = _signal_diagnostics_section()
     probability_section = _probability_summary_section()
     target_section = _target_and_calibration_section()
+    model_quality_section = _model_quality_section()
     robustness_section = _robustness_section()
     degraded = "unknown"
     if not trades.empty:
@@ -260,6 +292,8 @@ Generated: {datetime.now(timezone.utc).isoformat()}
 {signal_section}
 
 {target_section}
+
+{model_quality_section}
 
 {probability_section}
 

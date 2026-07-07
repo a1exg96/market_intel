@@ -15,6 +15,7 @@ import pandas as pd
 import yaml
 
 from scripts.common import CONFIG_DIR, LAB_CONFIG, PROCESSED_DIR, RAW_DIR, REPORTS_DIR, ensure_dirs, market_symbols, max_drawdown, profit_factor, read_parquet
+from scripts.protections import evaluate_protections
 
 MAX_CONFIG_RISK_PER_TRADE = 0.005
 
@@ -447,78 +448,6 @@ def _risk_multiplier_from_history(trades: pd.DataFrame, config: PaperTradingConf
     return 1.0
 
 
-def _consecutive_losses(trades: pd.DataFrame) -> int:
-    if trades.empty or "pnl_usd" not in trades:
-        return 0
-    pnl = pd.to_numeric(trades["pnl_usd"], errors="coerce").fillna(0.0)
-    streak = 0
-    for value in reversed(pnl.tolist()):
-        if value < 0:
-            streak += 1
-        else:
-            break
-    return streak
-
-
-def _daily_trades(trades: pd.DataFrame) -> pd.DataFrame:
-    if trades.empty or "closed_at" not in trades:
-        return trades.iloc[0:0]
-    closed_at = pd.to_datetime(trades["closed_at"], utc=True, errors="coerce", format="mixed")
-    start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
-    return trades[closed_at.ge(start_of_day)]
-
-
-def _daily_loss_limit_hit(trades: pd.DataFrame, config: PaperTradingConfig) -> bool:
-    if trades.empty or config.max_daily_loss_pct <= 0:
-        return False
-    today = _daily_trades(trades)
-    if today.empty:
-        return False
-    pnl = pd.to_numeric(today["pnl_usd"], errors="coerce").fillna(0.0).sum()
-    return float(pnl) <= -(float(config.initial_balance) * float(config.max_daily_loss_pct))
-
-
-def _daily_trade_limit_hit(trades: pd.DataFrame, config: PaperTradingConfig) -> bool:
-    if config.max_daily_trades <= 0:
-        return False
-    return len(_daily_trades(trades)) >= int(config.max_daily_trades)
-
-
-def _historical_drawdown(trades: pd.DataFrame, config: PaperTradingConfig) -> float:
-    balances = [config.initial_balance]
-    if not trades.empty:
-        balances.extend(pd.to_numeric(trades["balance_after"], errors="coerce").dropna().astype(float).tolist())
-    return max_drawdown(balances)
-
-
-def _cooldown_active(symbol: str, trades: pd.DataFrame, config: PaperTradingConfig) -> bool:
-    if trades.empty or config.cooldown_minutes <= 0:
-        return False
-    if not {"symbol", "closed_at", "reason"}.issubset(trades.columns):
-        return False
-    closed_at = pd.to_datetime(trades["closed_at"], utc=True, errors="coerce", format="mixed")
-    recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=config.cooldown_minutes)
-    reasons = trades["reason"].astype(str).str.upper()
-    matches = (
-        (trades["symbol"].astype(str) == symbol)
-        & closed_at.ge(recent_cutoff)
-        & reasons.isin(["STOP_LOSS", "LIQUIDATION", "MANUAL"])
-    )
-    return bool(matches.any())
-
-
-def _symbol_loss_cooldown_active(symbol: str, trades: pd.DataFrame, config: PaperTradingConfig) -> bool:
-    if trades.empty or config.symbol_loss_cooldown_minutes <= 0:
-        return False
-    if not {"symbol", "closed_at", "pnl_usd"}.issubset(trades.columns):
-        return False
-    closed_at = pd.to_datetime(trades["closed_at"], utc=True, errors="coerce", format="mixed")
-    recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=config.symbol_loss_cooldown_minutes)
-    pnl = pd.to_numeric(trades["pnl_usd"], errors="coerce").fillna(0.0)
-    matches = (trades["symbol"].astype(str) == symbol) & closed_at.ge(recent_cutoff) & (pnl < 0)
-    return bool(matches.any())
-
-
 def _stop_distance(side: str, entry_price: float, stop_loss: float) -> float:
     if entry_price <= 0 or stop_loss <= 0:
         return 0.0
@@ -630,23 +559,9 @@ def open_position_from_signal(signal: dict[str, Any], config: PaperTradingConfig
         opened_at = datetime.now(timezone.utc).isoformat()
         balance = _realized_balance(config)
         trades = read_trades()
-        if _daily_trade_limit_hit(trades, config):
-            _audit(signal, action, False, "DAILY_TRADE_LIMIT")
-            return None
-        if _daily_loss_limit_hit(trades, config):
-            _audit(signal, action, False, "DAILY_LOSS_LIMIT")
-            return None
-        if config.max_consecutive_losses > 0 and _consecutive_losses(trades) >= config.max_consecutive_losses:
-            _audit(signal, action, False, "CONSECUTIVE_LOSS_LIMIT")
-            return None
-        if _cooldown_active(symbol, trades, config):
-            _audit(signal, action, False, "COOLDOWN_ACTIVE")
-            return None
-        if _symbol_loss_cooldown_active(symbol, trades, config):
-            _audit(signal, action, False, "SYMBOL_LOSS_COOLDOWN")
-            return None
-        if abs(_historical_drawdown(trades, config)) >= config.max_drawdown_live_block:
-            _audit(signal, action, False, "DRAWDOWN_LIVE_BLOCK")
+        protection = evaluate_protections(symbol, trades, config)
+        if not protection.allowed:
+            _audit(signal, action, False, protection.reason)
             return None
         risk_fraction = min(float(config.risk_per_trade), MAX_CONFIG_RISK_PER_TRADE) * _risk_multiplier_from_history(trades, config)
         risk_budget = balance * risk_fraction
