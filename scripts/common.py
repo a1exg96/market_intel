@@ -26,8 +26,8 @@ class LabConfig:
     raw_symbol: str = "BTCUSDT"
     timeframe: str = "5m"
     initial_balance: float = 1000.0
-    risk_per_trade: float = 0.01
-    confidence_threshold: float = 0.60
+    risk_per_trade: float = 0.005
+    confidence_threshold: float = 0.70
     fee_pct: float = 0.0004
     slippage_pct: float = 0.0003
     flat_band: float = 0.0015

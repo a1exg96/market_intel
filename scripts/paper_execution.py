@@ -16,6 +16,8 @@ import yaml
 
 from scripts.common import CONFIG_DIR, LAB_CONFIG, PROCESSED_DIR, RAW_DIR, REPORTS_DIR, ensure_dirs, market_symbols, max_drawdown, profit_factor, read_parquet
 
+MAX_CONFIG_RISK_PER_TRADE = 0.005
+
 ACTIVE_POSITION_COLUMNS = [
     "position_id",
     "opened_at",
@@ -86,8 +88,13 @@ class PaperTradingConfig:
     confidence_threshold: float = LAB_CONFIG.confidence_threshold
     min_expected_return: float = 0.0005
     min_risk_reward: float = 1.5
-    cooldown_minutes: int = 60
-    loss_streak_reduce_after: int = 2
+    min_entry_quality: float = 0.0
+    cooldown_minutes: int = 180
+    loss_streak_reduce_after: int = 1
+    max_consecutive_losses: int = 2
+    max_daily_loss_pct: float = 0.02
+    max_daily_trades: int = 6
+    symbol_loss_cooldown_minutes: int = 360
     max_drawdown_live_block: float = 0.10
 
 
@@ -110,8 +117,8 @@ def load_paper_trading_config(path: Path | None = None) -> PaperTradingConfig:
         raise RuntimeError("ERROR: leverage must be positive.")
     if config.risk_per_trade <= 0:
         raise RuntimeError("ERROR: risk_per_trade must be positive.")
-    if config.risk_per_trade > 0.01:
-        config = replace(config, risk_per_trade=0.01)
+    if config.risk_per_trade > MAX_CONFIG_RISK_PER_TRADE:
+        config = replace(config, risk_per_trade=MAX_CONFIG_RISK_PER_TRADE)
     if config.liquidation_long_pct <= 0 or config.liquidation_short_pct <= 0:
         raise RuntimeError("ERROR: liquidation percentages must be positive.")
     return config
@@ -127,6 +134,9 @@ def paper_trading_settings(path: Path | None = None) -> dict[str, Any]:
         "take_profit_pct": float(config.take_profit_pct),
         "horizon_minutes": int(config.horizon_minutes),
         "confidence_threshold": float(config.confidence_threshold),
+        "min_entry_quality": float(config.min_entry_quality),
+        "max_daily_loss_pct": float(config.max_daily_loss_pct),
+        "max_daily_trades": int(config.max_daily_trades),
     }
 
 
@@ -159,6 +169,14 @@ def update_paper_trading_settings(values: dict[str, Any], path: Path | None = No
     stake_pct = positive_float("stake_pct", 0.01, 1)
     if stake_pct is not None:
         raw["risk_per_trade"] = stake_pct / 100
+
+    confidence_threshold = positive_float("confidence_threshold", 0.0, 1.0)
+    if confidence_threshold is not None:
+        raw["confidence_threshold"] = confidence_threshold
+
+    min_entry_quality = positive_float("min_entry_quality", 0.0, 1.0)
+    if min_entry_quality is not None:
+        raw["min_entry_quality"] = min_entry_quality
 
     liquidation_long_pct = positive_float("liquidation_long_pct", 0.01, 100)
     if liquidation_long_pct is not None:
@@ -429,6 +447,43 @@ def _risk_multiplier_from_history(trades: pd.DataFrame, config: PaperTradingConf
     return 1.0
 
 
+def _consecutive_losses(trades: pd.DataFrame) -> int:
+    if trades.empty or "pnl_usd" not in trades:
+        return 0
+    pnl = pd.to_numeric(trades["pnl_usd"], errors="coerce").fillna(0.0)
+    streak = 0
+    for value in reversed(pnl.tolist()):
+        if value < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def _daily_trades(trades: pd.DataFrame) -> pd.DataFrame:
+    if trades.empty or "closed_at" not in trades:
+        return trades.iloc[0:0]
+    closed_at = pd.to_datetime(trades["closed_at"], utc=True, errors="coerce", format="mixed")
+    start_of_day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    return trades[closed_at.ge(start_of_day)]
+
+
+def _daily_loss_limit_hit(trades: pd.DataFrame, config: PaperTradingConfig) -> bool:
+    if trades.empty or config.max_daily_loss_pct <= 0:
+        return False
+    today = _daily_trades(trades)
+    if today.empty:
+        return False
+    pnl = pd.to_numeric(today["pnl_usd"], errors="coerce").fillna(0.0).sum()
+    return float(pnl) <= -(float(config.initial_balance) * float(config.max_daily_loss_pct))
+
+
+def _daily_trade_limit_hit(trades: pd.DataFrame, config: PaperTradingConfig) -> bool:
+    if config.max_daily_trades <= 0:
+        return False
+    return len(_daily_trades(trades)) >= int(config.max_daily_trades)
+
+
 def _historical_drawdown(trades: pd.DataFrame, config: PaperTradingConfig) -> float:
     balances = [config.initial_balance]
     if not trades.empty:
@@ -449,6 +504,18 @@ def _cooldown_active(symbol: str, trades: pd.DataFrame, config: PaperTradingConf
         & closed_at.ge(recent_cutoff)
         & reasons.isin(["STOP_LOSS", "LIQUIDATION", "MANUAL"])
     )
+    return bool(matches.any())
+
+
+def _symbol_loss_cooldown_active(symbol: str, trades: pd.DataFrame, config: PaperTradingConfig) -> bool:
+    if trades.empty or config.symbol_loss_cooldown_minutes <= 0:
+        return False
+    if not {"symbol", "closed_at", "pnl_usd"}.issubset(trades.columns):
+        return False
+    closed_at = pd.to_datetime(trades["closed_at"], utc=True, errors="coerce", format="mixed")
+    recent_cutoff = datetime.now(timezone.utc) - timedelta(minutes=config.symbol_loss_cooldown_minutes)
+    pnl = pd.to_numeric(trades["pnl_usd"], errors="coerce").fillna(0.0)
+    matches = (trades["symbol"].astype(str) == symbol) & closed_at.ge(recent_cutoff) & (pnl < 0)
     return bool(matches.any())
 
 
@@ -533,6 +600,10 @@ def open_position_from_signal(signal: dict[str, Any], config: PaperTradingConfig
         if risk_reward is None or risk_reward < config.min_risk_reward:
             _audit(signal, action, False, "LOW_RISK_REWARD")
             return None
+        entry_quality = _signal_float(signal, "entry_quality")
+        if entry_quality is not None and entry_quality < config.min_entry_quality:
+            _audit(signal, action, False, "LOW_ENTRY_QUALITY")
+            return None
         if stop_loss is None or take_profit is None:
             _audit(signal, action, False, "MISSING_RISK_PLAN")
             return None
@@ -559,13 +630,25 @@ def open_position_from_signal(signal: dict[str, Any], config: PaperTradingConfig
         opened_at = datetime.now(timezone.utc).isoformat()
         balance = _realized_balance(config)
         trades = read_trades()
+        if _daily_trade_limit_hit(trades, config):
+            _audit(signal, action, False, "DAILY_TRADE_LIMIT")
+            return None
+        if _daily_loss_limit_hit(trades, config):
+            _audit(signal, action, False, "DAILY_LOSS_LIMIT")
+            return None
+        if config.max_consecutive_losses > 0 and _consecutive_losses(trades) >= config.max_consecutive_losses:
+            _audit(signal, action, False, "CONSECUTIVE_LOSS_LIMIT")
+            return None
         if _cooldown_active(symbol, trades, config):
             _audit(signal, action, False, "COOLDOWN_ACTIVE")
+            return None
+        if _symbol_loss_cooldown_active(symbol, trades, config):
+            _audit(signal, action, False, "SYMBOL_LOSS_COOLDOWN")
             return None
         if abs(_historical_drawdown(trades, config)) >= config.max_drawdown_live_block:
             _audit(signal, action, False, "DRAWDOWN_LIVE_BLOCK")
             return None
-        risk_fraction = min(float(config.risk_per_trade), 0.01) * _risk_multiplier_from_history(trades, config)
+        risk_fraction = min(float(config.risk_per_trade), MAX_CONFIG_RISK_PER_TRADE) * _risk_multiplier_from_history(trades, config)
         risk_budget = balance * risk_fraction
         suggested_size = _signal_float(signal, "position_size", 0.0) or 0.0
         risk_sized_position = risk_budget / max(stop_distance * float(config.leverage), 1e-9)

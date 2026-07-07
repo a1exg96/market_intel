@@ -5,6 +5,7 @@ import unittest
 import os
 import time
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -399,7 +400,100 @@ class PaperExecutionTest(unittest.TestCase):
 
             config = pe.load_paper_trading_config(config_path)
 
-            self.assertEqual(config.risk_per_trade, 0.01)
+            self.assertEqual(config.risk_per_trade, 0.005)
+
+    def test_consecutive_loss_limit_blocks_new_position(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            reports = Path(tmp)
+            original_paths = (
+                pe.ACTIVE_POSITIONS_PATH,
+                pe.TRADES_PATH,
+                pe.AUDIT_PATH,
+                pe.SIGNALS_PATH,
+                pe.LOCK_PATH,
+                pe.latest_local_prices,
+            )
+            pe.ACTIVE_POSITIONS_PATH = reports / "active_positions.csv"
+            pe.TRADES_PATH = reports / "trades.csv"
+            pe.AUDIT_PATH = reports / "signal_execution_audit.csv"
+            pe.SIGNALS_PATH = reports / "forward_signals.csv"
+            pe.LOCK_PATH = reports / ".paper_execution.lock"
+            pe.latest_local_prices = lambda: {"BTCUSDT": 100.0}
+            try:
+                pe.ensure_paper_files()
+                now = datetime.now(timezone.utc).isoformat()
+                pd.DataFrame(
+                    [
+                        {
+                            "position_id": "loss_1",
+                            "opened_at": now,
+                            "closed_at": now,
+                            "symbol": "ETHUSDT",
+                            "side": "LONG",
+                            "entry_price": 100.0,
+                            "exit_price": 99.0,
+                            "position_size": 100.0,
+                            "confidence": 0.8,
+                            "expected_return": 0.004,
+                            "expected_risk": 0.011,
+                            "risk_reward": 2.0,
+                            "stop_loss": 99.0,
+                            "take_profit": 102.0,
+                            "pnl_usd": -1.0,
+                            "pnl_pct": -1.0,
+                            "balance_after": 999.0,
+                            "reason": "STOP_LOSS",
+                            "model_version": "test_v1",
+                        },
+                        {
+                            "position_id": "loss_2",
+                            "opened_at": now,
+                            "closed_at": now,
+                            "symbol": "SOLUSDT",
+                            "side": "LONG",
+                            "entry_price": 100.0,
+                            "exit_price": 99.0,
+                            "position_size": 100.0,
+                            "confidence": 0.8,
+                            "expected_return": 0.004,
+                            "expected_risk": 0.011,
+                            "risk_reward": 2.0,
+                            "stop_loss": 99.0,
+                            "take_profit": 102.0,
+                            "pnl_usd": -1.0,
+                            "pnl_pct": -1.0,
+                            "balance_after": 998.0,
+                            "reason": "STOP_LOSS",
+                            "model_version": "test_v1",
+                        },
+                    ],
+                    columns=pe.TRADE_COLUMNS,
+                ).to_csv(pe.TRADES_PATH, index=False)
+
+                opened = pe.open_position_from_signal(
+                    {
+                        "symbol": "BTCUSDT",
+                        "signal": "LONG",
+                        "confidence": 0.8,
+                        "price": 100.0,
+                        "decision": "EXECUTABLE",
+                        **self._edge_signal("LONG", 100.0, confidence=0.8),
+                    },
+                    config=PaperTradingConfig(max_consecutive_losses=2, confidence_threshold=0.72),
+                )
+                audit = pe.read_audit()
+
+                self.assertIsNone(opened)
+                self.assertEqual(audit.loc[0, "reason"], "CONSECUTIVE_LOSS_LIMIT")
+            finally:
+                (
+                    pe.ACTIVE_POSITIONS_PATH,
+                    pe.TRADES_PATH,
+                    pe.AUDIT_PATH,
+                    pe.SIGNALS_PATH,
+                    pe.LOCK_PATH,
+                    pe.latest_local_prices,
+                ) = original_paths
 
     def test_leverage_multiplies_unrealized_pnl_and_stop_loss_prevents_liquidation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -446,7 +540,7 @@ class PaperExecutionTest(unittest.TestCase):
 
                 self.assertEqual(positions.loc[0, "status"], "CLOSED")
                 self.assertEqual(trades.loc[0, "reason"], "STOP_LOSS")
-                self.assertAlmostEqual(float(positions.loc[0, "unrealized_pnl_usd"]), -10.0, places=6)
+                self.assertAlmostEqual(float(positions.loc[0, "unrealized_pnl_usd"]), -5.0, places=6)
             finally:
                 (
                     pe.ACTIVE_POSITIONS_PATH,

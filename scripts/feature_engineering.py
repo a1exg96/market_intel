@@ -72,6 +72,56 @@ def _future_max_down(low: pd.Series, close: pd.Series, horizon: int) -> pd.Serie
     return future_low / close - 1
 
 
+def _first_touch_targets(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    horizon: int,
+    target_threshold: float,
+) -> tuple[pd.Series, pd.Series]:
+    long_targets: list[int | float] = []
+    short_targets: list[int | float] = []
+    highs = high.to_numpy(dtype=float)
+    lows = low.to_numpy(dtype=float)
+    closes = close.to_numpy(dtype=float)
+    total = len(close)
+    for idx, entry in enumerate(closes):
+        if idx + horizon >= total or not np.isfinite(entry) or entry <= 0:
+            long_targets.append(np.nan)
+            short_targets.append(np.nan)
+            continue
+        long_take_profit = entry * (1 + target_threshold)
+        long_stop_loss = entry * (1 - target_threshold)
+        short_take_profit = entry * (1 - target_threshold)
+        short_stop_loss = entry * (1 + target_threshold)
+        long_hit = 0
+        short_hit = 0
+        for step in range(idx + 1, idx + horizon + 1):
+            candle_high = highs[step]
+            candle_low = lows[step]
+            long_stop = candle_low <= long_stop_loss
+            long_take = candle_high >= long_take_profit
+            # If both sides touch inside one candle, keep the label conservative.
+            if long_stop:
+                break
+            if long_take:
+                long_hit = 1
+                break
+        for step in range(idx + 1, idx + horizon + 1):
+            candle_high = highs[step]
+            candle_low = lows[step]
+            short_stop = candle_high >= short_stop_loss
+            short_take = candle_low <= short_take_profit
+            if short_stop:
+                break
+            if short_take:
+                short_hit = 1
+                break
+        long_targets.append(long_hit)
+        short_targets.append(short_hit)
+    return pd.Series(long_targets, index=close.index), pd.Series(short_targets, index=close.index)
+
+
 def _atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
     prev_close = df["close"].shift(1)
     tr = pd.concat(
@@ -103,8 +153,9 @@ def build_features(symbol: str = LAB_CONFIG.raw_symbol, interval: str = LAB_CONF
         df[f"future_max_up_{horizon_name}"] = _future_max_up(df["high"], df["close"], horizon_rows)
         df[f"future_max_down_{horizon_name}"] = _future_max_down(df["low"], df["close"], horizon_rows)
         for suffix, threshold in {"005": 0.005, "010": 0.010, "015": 0.015, "020": 0.020}.items():
-            df[f"long_target_{horizon_name}_{suffix}"] = (df[f"future_max_up_{horizon_name}"] > threshold).astype(int)
-            df[f"short_target_{horizon_name}_{suffix}"] = (df[f"future_max_down_{horizon_name}"] < -threshold).astype(int)
+            long_target, short_target = _first_touch_targets(df["high"], df["low"], df["close"], horizon_rows, threshold)
+            df[f"long_target_{horizon_name}_{suffix}"] = long_target
+            df[f"short_target_{horizon_name}_{suffix}"] = short_target
     df["volume_zscore"] = _zscore(df["volume"], STEPS_PER_HOUR * 24)
     df["range_pct"] = (df["high"] - df["low"]) / df["close"]
     df["body_pct"] = (df["close"] - df["open"]).abs() / df["open"]

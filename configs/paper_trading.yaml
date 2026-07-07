@@ -1,6 +1,6 @@
 live_trading: false
 initial_balance: 1000.0
-risk_per_trade: 0.01
+risk_per_trade: 0.003
 leverage: 1.0
 horizon_minutes: 240
 take_profit_pct: 1.0
@@ -9,4 +9,11 @@ liquidation_long_pct: 0.7
 liquidation_short_pct: 0.7
 fee_pct: 0.0004
 slippage_pct: 0.0003
-confidence_threshold: 0.60
+confidence_threshold: 0.72
+min_entry_quality: 0.35
+cooldown_minutes: 180
+loss_streak_reduce_after: 1
+max_consecutive_losses: 2
+max_daily_loss_pct: 0.02
+max_daily_trades: 6
+symbol_loss_cooldown_minutes: 360
